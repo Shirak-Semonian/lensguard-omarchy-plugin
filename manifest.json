@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.shirak-semonian.lensguard",
+  "name": "LensGuard",
+  "version": "0.1.0",
+  "author": "Shirak Semonian",
+  "license": "MIT",
+  "description": "Camera activity guard for the Omarchy bar: quietly watches which process holds /dev/video* open and clearly shows when the webcam is in use. Idle is calm, camera-in-use is unmistakable, and a tooltip names the process. Detects any app that opens the camera — including browsers, because PipeWire opens the device on their behalf. No service, no key, no network.",
+  "homepage": "https://github.com/Shirak-Semonian/lensguard-omarchy-plugin",
+  "repository": "https://github.com/Shirak-Semonian/lensguard-omarchy-plugin",
+  "keywords": [
+    "lensguard",
+    "camera",
+    "webcam",
+    "privacy",
+    "security",
+    "monitor",
+    "v4l",
+    "video",
+    "system",
+    "widget"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "LensGuard",
+    "description": "Camera activity guard — shows when a process uses the webcam",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
