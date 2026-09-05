@@ -485,6 +485,36 @@ has(ng[2], "flock", "gate uses flock")
 has(ng[2], "prevme", "gate is instance-aware (a twin is skipped, self is not)")
 has(ng[2], "echo skip", "gate can skip (twin instance)")
 
+// --- one-shot IO task watchdog (MI-5 class fix, LG-5) ----------------------
+eq(M.WRITE_WATCHDOG_MS, 5000, "one-shot writes are killed after 5 s")
+eq(M.NOTIF_WATCHDOG_MS, 10000, "notification phases have a 10 s watchdog budget")
+ok(M.NOTIF_WATCHDOG_MS >= M.WRITE_WATCHDOG_MS * 2,
+  "notification budget leaves room over the bounded gate flock wait")
+eq(M.NOTIF_GATE_TTL_S, 25, "twin-instance skip window is 25 s")
+eq(M.NOTIF_GATE_FLOCK_WAIT_S, 3, "gate flock is bounded to 3 s")
+has(ng[2], "flock -w " + M.NOTIF_GATE_FLOCK_WAIT_S,
+  "gate script uses the bounded flock wait (a wedged twin can never block the gate forever)")
+const ngDef = M.notifGateCommandArgs("/tmp/lg.gate", "opened|9001", "inst-A")
+has(ngDef[2], "flock -w", "gate default-ttl path also builds a bounded flock")
+
+// --- regression: no long-lived reusable Process objects --------------------
+// Every Process must live inside a Component factory and be created fresh
+// per run (probe, one-shot writes/notifications, investigate). A top-level
+// reusable Process reused many times can lose its exit event and report
+// running forever — the exact class that silently stalled MyIP's polling and
+// that LG-5 removes from LensGuard's write/notification paths.
+const fs = require("fs")
+const path = require("path")
+const srcBar = fs.readFileSync(path.join(__dirname, "BarWidget.qml"), "utf8")
+ok(!/^  Process \{/m.test(srcBar),
+  "BarWidget: no top-level reusable Process (each lives in a Component factory)")
+ok(/id: ioTaskComponent/.test(srcBar), "BarWidget: one-shot IO task factory present")
+ok(/id: probeProcessComponent/.test(srcBar), "BarWidget: probe factory present")
+const srcPanel = fs.readFileSync(path.join(__dirname, "Panel.qml"), "utf8")
+ok(!/^  Process \{/m.test(srcPanel),
+  "Panel: no top-level reusable Process (investigate runs on a fresh object)")
+ok(/id: investigateTaskComponent/.test(srcPanel), "Panel: investigate factory present")
+
 // --- bar process text (showProcessInBar / compactMode) --------------------
 const idleView2 = { status: "idle", users: [], errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null, history: [], openedAt: {} }
 eq(M.barProcessText(idleView2, M.DEFAULT_WHITELIST), "", "idle -> no bar text")

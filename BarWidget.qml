@@ -71,6 +71,13 @@ import "Model.js" as Model
 // the next probe starts on a fresh one — a single lost exit can never stall
 // the widget again.
 //
+// The same MI-5 rule applies to every one-shot task the widget starts (the
+// atomic state/config writes, the config reset and the two notification
+// phases): each send/write runs on a FRESH Process object created per task
+// and destroyed when the task ends, and the heartbeat watchdog applies the
+// same kill-then-rebuild recovery (see "one-shot IO tasks" below) so a
+// wedged writer can never stall persistence or the notification queue.
+//
 // The first successful poll after startup is a silent baseline: when the
 // widget starts while the camera is already in use it shows `active`
 // immediately but does not ring a false "opened" event (the panel only
@@ -122,6 +129,18 @@ BarWidget {
   property bool _pollKillSent: false
   property int _pollRecoveries: 0
   property string _logKey: ""
+  // One-shot IO tasks (state/config/reset writes, notification phases) also
+  // run on FRESH Process objects + the heartbeat watchdog (MI-5 rule).
+  property var _stateWriter: null
+  property string _stateWriteText: ""
+  property bool _stateRecovered: false
+  property var _configWriter: null
+  property bool _configWriteQueued: false
+  property bool _configRecovered: false
+  property var _resetWriter: null
+  property bool _resetRecovered: false
+  property var _notifTask: null
+  property string _notifPhase: ""
 
   // Icon cross-fade state (two stacked layers, see advanceIcon()).
   property bool _iconReady: false
@@ -133,8 +152,7 @@ BarWidget {
   // ---- notification queue (serialized + cross-instance gate) -------------
   property var _notifQueue: []
   property var _notifPending: null
-  property bool _notifGateMode: false
-  property string _notifOut: ""
+  property int _notifRecoveries: 0
 
   readonly property var whitelist: root.config.whitelist || Model.DEFAULT_WHITELIST
 
@@ -300,9 +318,7 @@ BarWidget {
     }
     root._lastConfigRaw = ""
     root.config = cfg
-    configWriteProc.command = Model.writeConfigCommandArgs(
-      root.configPath, cfg, root._configRaw)
-    configWriteProc.running = true
+    root.startConfigWrite()
   }
 
   function setConfigValue(key, value) {
@@ -334,9 +350,10 @@ BarWidget {
   // one — is kept as config.json.bak by the reset script; fresh defaults are
   // then written atomically, mode 600. Never echoes file content anywhere.
   function resetConfigToDefaults() {
-    if (resetConfigProc.running) return
-    resetConfigProc.command = Model.configResetCommandArgs(root.configPath)
-    resetConfigProc.running = true
+    if (root._resetWriter) return
+    var ok = root.startIoWrite("reset",
+      Model.configResetCommandArgs(root.configPath))
+    if (!ok) console.warn("LensGuard: could not start the config reset")
   }
 
   // Open the whitelist config in the user's editor (Omarchy fixed helper;
@@ -512,14 +529,13 @@ BarWidget {
       && (!next.history || next.history.length === 0)) return
     var text = Model.stateToText(next)
     root._lastStateText = text
-    if (stateWriteProc.running) {
+    if (root._stateWriter) {
       // The writer is busy with an older snapshot; it will re-kick on exit
       // so the latest text always wins (coalescing, no lost updates).
       root._stateWritePending = text
       return
     }
-    stateWriteProc.command = Model.writeStateCommandArgs(root.stateFile, text)
-    stateWriteProc.running = true
+    root.writeStateText(text)
   }
 
   // ---- notifications -----------------------------------------------------
@@ -538,35 +554,263 @@ BarWidget {
   }
 
   function runNextNotification() {
-    if (notifProc.running) return
+    if (root._notifTask) return
     if (root._notifQueue.length === 0) return
     var entry = root._notifQueue[0]
     root._notifQueue = root._notifQueue.slice(1)
     root._notifPending = entry
-    root._notifGateMode = true
-    root._notifOut = ""
-    notifProc.command = Model.notifGateCommandArgs(root.notifGateFile,
-      entry.key, root._instanceId, 25)
-    notifProc.running = true
+    root.startNotifPhase("notifGate", Model.notifGateCommandArgs(
+      root.notifGateFile, entry.key, root._instanceId, Model.NOTIF_GATE_TTL_S))
   }
 
-  function finishNotification(exitCode, output) {
-    if (root._notifGateMode) {
-      root._notifGateMode = false
-      var gate = String(output == null ? "" : output).trim()
-      var entry = root._notifPending
+  // ---- one-shot IO tasks -------------------------------------------------
+  // Every send/write the widget performs (the atomic state/config writes,
+  // the config reset and the two notification phases) runs on a FRESH
+  // Process object created per task and destroyed when the task ends — never
+  // on a long-lived reused Process. A single Quickshell Process reused many
+  // times can lose an exit event and then report running forever (MI-5
+  // lesson, MyIP), silently stalling the state file, the config or the
+  // notification queue. The heartbeat watchdog below applies the same
+  // kill-then-rebuild recovery as the camera probe: first strike SIGKILLs
+  // the child, second strike drops the wedged object and recovers the task
+  // (writes are idempotent full-file writes, so a retry is always safe).
+
+  function ioTaskSlot(kind) {
+    if (kind === "state") return root._stateWriter
+    if (kind === "config") return root._configWriter
+    if (kind === "reset") return root._resetWriter
+    if (kind === "notif") return root._notifTask
+    return null
+  }
+
+  function clearIoTaskSlot(kind, task) {
+    if (kind === "state" && root._stateWriter === task) root._stateWriter = null
+    else if (kind === "config" && root._configWriter === task) root._configWriter = null
+    else if (kind === "reset" && root._resetWriter === task) root._resetWriter = null
+    else if (kind === "notif" && root._notifTask === task) root._notifTask = null
+  }
+
+  function releaseIoTask(task, kind) {
+    if (!task || task.released) return
+    task.released = true
+    root.clearIoTaskSlot(kind, task)
+    task.destroy()
+  }
+
+  // Fresh Process for a state/config/reset write (one-shot). Returns false
+  // when the object could not be created; the caller reports it.
+  function startIoWrite(kind, command) {
+    var t = ioTaskComponent.createObject(root, { taskKind: kind, command: command })
+    if (!t) return false
+    t.taskDeadlineAt = Date.now() + Model.WRITE_WATCHDOG_MS
+    if (kind === "state") root._stateWriter = t
+    else if (kind === "config") root._configWriter = t
+    else root._resetWriter = t
+    t.running = true
+    return true
+  }
+
+  // ---- state writes ------------------------------------------------------
+  function writeStateText(text) {
+    if (root._stateWriter) {
+      // A writer is already running; it re-kicks on exit, latest text wins.
+      root._stateWritePending = text
+      return
+    }
+    root._stateWriteText = text
+    var ok = root.startIoWrite("state",
+      Model.writeStateCommandArgs(root.stateFile, text))
+    if (!ok) console.warn("LensGuard: could not start the state write")
+  }
+
+  // ---- config writes / reset ---------------------------------------------
+  function startConfigWrite() {
+    if (root._configWriter) {
+      // Busy: one more write after the current one finishes, always with the
+      // latest in-memory config (last write wins, never a dropped change).
+      root._configWriteQueued = true
+      return
+    }
+    var ok = root.startIoWrite("config",
+      Model.writeConfigCommandArgs(root.configPath, root.config, root._configRaw))
+    if (!ok) console.warn("LensGuard: could not start the settings write")
+  }
+
+  // ---- notifications (gate phase, then send phase) -----------------------
+  function startNotifPhase(kind, command) {
+    if (root._notifTask) return
+    if (!command || command.length === 0) {
       root._notifPending = null
-      if (gate === "send" && entry && entry.args) {
-        console.log("LensGuard: notification — " + entry.summary)
-        notifProc.command = entry.args
-        notifProc.running = true
-        return
-      }
       Qt.callLater(root.runNextNotification)
       return
     }
-    root._notifPending = null
-    Qt.callLater(root.runNextNotification)
+    root._notifPhase = (kind === "notifSend") ? "send" : "gate"
+    var t = ioTaskComponent.createObject(root, { taskKind: kind, command: command })
+    if (!t) {
+      console.warn("LensGuard: could not create the notification process")
+      root._notifPending = null
+      Qt.callLater(root.runNextNotification)
+      return
+    }
+    root._notifTask = t
+    // The gate waits on a bounded flock (Model.NOTIF_GATE_FLOCK_WAIT_S), so
+    // this budget comfortably covers both phases without ever stalling the
+    // queue forever when an exit event is lost.
+    t.taskDeadlineAt = Date.now() + Model.NOTIF_WATCHDOG_MS
+    t.running = true
+  }
+
+  // Exit dispatcher for every one-shot task (writes and notification
+  // phases). A task killed by the watchdog is NOT treated as a normal
+  // completion; it goes through recoverIoTask() instead so a wedged writer
+  // can never fake a successful write.
+  function handleIoTaskExited(task, exitCode) {
+    if (!task || task.released) return
+    var kind = String(task.taskKind || "")
+    if (root.ioTaskSlot(kind) !== task) {
+      // Stale runner: the watchdog already dropped it.
+      root.releaseIoTask(task, kind)
+      return
+    }
+    // Read the output before the runner is destroyed (deleteLater).
+    var gate = (kind === "notifGate")
+      ? String(task.taskOutput || "").trim() : ""
+    if (task.taskKillSent) {
+      root.releaseIoTask(task, kind)
+      console.warn("LensGuard: " + kind + " task was killed by the watchdog")
+      root.recoverIoTask(kind)
+      return
+    }
+    root.releaseIoTask(task, kind)
+    if (kind === "state") {
+      if (exitCode !== 0) console.warn("LensGuard: could not persist the event history")
+      root._stateRecovered = false
+      if (root._stateWritePending !== "") {
+        var pending = root._stateWritePending
+        root._stateWritePending = ""
+        root.writeStateText(pending)
+      }
+    } else if (kind === "config") {
+      if (exitCode !== 0) console.warn("LensGuard: could not write the settings config")
+      else root.refreshConfig()
+      root._configRecovered = false
+      if (root._configWriteQueued) {
+        root._configWriteQueued = false
+        root.startConfigWrite()
+      }
+    } else if (kind === "reset") {
+      if (exitCode !== 0) console.warn("LensGuard: could not reset the settings config")
+      else {
+        console.log("LensGuard: settings reset to defaults (previous file kept as config.json.bak)")
+        root.refreshConfig()
+      }
+      root._resetRecovered = false
+    } else if (kind === "notifGate") {
+      root._notifRecoveries = 0
+      var entry = root._notifPending
+      if (gate === "send" && entry && entry.args) {
+        console.log("LensGuard: notification — " + entry.summary)
+        root.startNotifPhase("notifSend", entry.args)
+        return
+      }
+      root._notifPending = null
+      Qt.callLater(root.runNextNotification)
+    } else if (kind === "notifSend") {
+      if (exitCode !== 0) console.warn("LensGuard: could not send the camera notification")
+      root._notifRecoveries = 0
+      root._notifPending = null
+      Qt.callLater(root.runNextNotification)
+    }
+  }
+
+  // Heartbeat watchdog for the one-shot IO tasks (mirrors the probe
+  // watchdog). A healthy task finishes in milliseconds, so a task still
+  // running past its deadline has lost its exit event or its child hung.
+  function checkTaskWatchdog() {
+    root.checkOneTaskWatchdog("state")
+    root.checkOneTaskWatchdog("config")
+    root.checkOneTaskWatchdog("reset")
+    root.checkOneTaskWatchdog("notif")
+  }
+
+  function checkOneTaskWatchdog(kind) {
+    var t = root.ioTaskSlot(kind)
+    if (!t) return
+    if (Date.now() < t.taskDeadlineAt) return
+    if (!t.taskKillSent) {
+      t.taskKillSent = true
+      console.warn("LensGuard: " + kind + " task did not finish in time; killing it")
+      try { t.signal(9) } catch (error) { /* object may be gone */ }
+      try { t.running = false } catch (error) { /* ditto */ }
+      t.taskDeadlineAt = Date.now() + 3000
+      return
+    }
+    console.warn("LensGuard: " + kind + " task did not recover; dropping the wedged process")
+    root.releaseIoTask(t, kind)
+    root.recoverIoTask(kind)
+  }
+
+  // Recovery after the watchdog dropped a wedged Process. Writes retry once
+  // (idempotent full-file writes); a second consecutive failure gives up
+  // with a warning instead of looping. Notifications re-run the gate for
+  // the same entry (the gate is instance-aware: its own earlier record never
+  // suppresses the retry, so exactly one notification is sent), but a wedged
+  // SEND phase is treated as delivered — never resent — to preserve the
+  // "exactly one notification" guarantee.
+  function recoverIoTask(kind) {
+    if (kind === "state") {
+      if (root._stateRecovered) {
+        console.warn("LensGuard: event history write keeps failing; the next camera event will write the full history again")
+        root._stateWritePending = ""
+        return
+      }
+      root._stateRecovered = true
+      var text = root._stateWritePending !== ""
+        ? root._stateWritePending : root._stateWriteText
+      root._stateWritePending = ""
+      if (text === "") return
+      console.warn("LensGuard: retrying the event history write")
+      root.writeStateText(text)
+    } else if (kind === "config") {
+      if (root._configRecovered) {
+        console.warn("LensGuard: settings write keeps failing; it will be written on the next settings change")
+        root._configWriteQueued = false
+        return
+      }
+      root._configRecovered = true
+      console.warn("LensGuard: retrying the settings write")
+      // The retry IS the queued write when one is pending; clear the flag so
+      // the retry's natural exit does not start a duplicate write.
+      root._configWriteQueued = false
+      root.startConfigWrite()
+    } else if (kind === "reset") {
+      if (root._resetRecovered) {
+        console.warn("LensGuard: config reset keeps failing; the previous config was kept")
+        return
+      }
+      root._resetRecovered = true
+      console.warn("LensGuard: retrying the config reset")
+      root.resetConfigToDefaults()
+    } else if (kind === "notif") {
+      var entry = root._notifPending
+      if (root._notifPhase === "send" || !entry) {
+        // Send exit event lost: at-most-once — move on without resending.
+        root._notifPending = null
+        Qt.callLater(root.runNextNotification)
+        return
+      }
+      root._notifRecoveries++
+      if (root._notifRecoveries >= 3) {
+        console.warn("LensGuard: camera notification gate keeps failing; dropping this notification")
+        root._notifPending = null
+        Qt.callLater(root.runNextNotification)
+        return
+      }
+      console.warn("LensGuard: notification gate did not recover; re-running it")
+      root._notifQueue = [entry].concat(root._notifQueue)
+      root._notifPending = null
+      Qt.callLater(root.runNextNotification)
+    }
   }
 
   // ---- layout ------------------------------------------------------------
@@ -591,8 +835,10 @@ BarWidget {
     triggeredOnStart: true
     onTriggered: {
       // Probe self-heal first: a probe that overruns its deadline is killed /
-      // rebuilt regardless of the gate below.
+      // rebuilt regardless of the gate below. The one-shot IO tasks
+      // (state/config writes, notification phases) get the same watchdog.
       root.checkPollWatchdog()
+      root.checkTaskWatchdog()
       // Wait for the initial state-file read so a restored history can never
       // race the first live event (display ordering stays newest-first).
       if (!root._stateLoaded) {
@@ -678,63 +924,30 @@ BarWidget {
     }
   }
 
-  Process {
-    id: configWriteProc
-    command: []
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        console.warn("LensGuard: could not write the settings config")
-        return
+  // One-shot IO task factory. State/config/reset writes and the two
+  // notification phases run on a FRESH Process object per task (created on
+  // demand, destroyed on exit / watchdog recovery) — the same MI-5 rule as
+  // the probe factory above, so a wedged writer can never silently stall the
+  // state file, the config or the notification queue. The task object
+  // carries its kind + deadline for the heartbeat watchdog; the per-kind
+  // completion logic lives in handleIoTaskExited()/recoverIoTask().
+  Component {
+    id: ioTaskComponent
+    Process {
+      id: ioTaskProcess
+      property string taskKind: ""
+      property string taskOutput: ""
+      property bool released: false
+      property double taskDeadlineAt: 0
+      property bool taskKillSent: false
+      command: []
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: ioTaskProcess.taskOutput = text
       }
-      root.refreshConfig()
-    }
-  }
-
-  // Atomic config reset (LG-3): keeps config.json.bak, writes defaults.
-  Process {
-    id: resetConfigProc
-    command: []
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        console.warn("LensGuard: could not reset the settings config")
-        return
+      onExited: function(exitCode) {
+        root.handleIoTaskExited(ioTaskProcess, exitCode)
       }
-      console.log("LensGuard: settings reset to defaults (previous file kept as config.json.bak)")
-      root.refreshConfig()
-    }
-  }
-
-  Process {
-    id: stateWriteProc
-    command: []
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        console.warn("LensGuard: could not persist the event history")
-      }
-      // Coalescing: if a newer snapshot arrived while this write ran, write
-      // it now (the latest state always wins; no lost history updates).
-      if (root._stateWritePending !== "") {
-        var pending = root._stateWritePending
-        root._stateWritePending = ""
-        root._lastStateText = pending
-        stateWriteProc.command = Model.writeStateCommandArgs(root.stateFile, pending)
-        stateWriteProc.running = true
-      }
-    }
-  }
-
-  Process {
-    id: notifProc
-    command: []
-    stdout: StdioCollector {
-      id: notifStdout
-      waitForEnd: true
-      onStreamFinished: root._notifOut = text
-    }
-    onExited: function(exitCode) {
-      var output = String(notifStdout.text || root._notifOut || "")
-      root._notifOut = ""
-      root.finishNotification(exitCode, output)
     }
   }
 

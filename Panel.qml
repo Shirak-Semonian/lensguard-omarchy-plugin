@@ -87,10 +87,13 @@ Panel {
     return "No camera activity \u2014 your lens is safe."
   }
 
-  // Investigate (full command line of an unknown process).
+  // Investigate (full command line of an unknown process). Runs on a FRESH
+  // Process object per click (MI-5 rule — see the factory at the bottom), so
+  // a lost exit event can never wedge later investigates.
   property string _investigatePid: ""
   property string _investigateOutput: ""
   property bool _investigateRunning: false
+  property var _investigateTask: null
 
   function open() {
     root.controller.show()
@@ -158,14 +161,53 @@ Panel {
       root._investigateOutput = ""
       return
     }
-    if (root._investigateRunning) return // one probe at a time
+    if (root._investigateTask) return // one probe at a time
     var cmd = Model.investigateCommand(pid)
     if (!cmd) return
     root._investigatePid = key
     root._investigateOutput = ""
+    var t = investigateTaskComponent.createObject(root, { command: cmd })
+    if (!t) {
+      console.warn("LensGuard: could not create the investigate process")
+      root._investigatePid = ""
+      return
+    }
+    root._investigateTask = t
     root._investigateRunning = true
-    investigateProc.command = cmd
-    investigateProc.running = true
+    investigateWatchdog.restart()
+    t.running = true
+  }
+
+  // End an investigate run (normal exit or watchdog). A wedged object (lost
+  // exit event) or a genuinely hung /proc read can never block the next
+  // "Investigate" click: the watchdog caps the run, kills the child and
+  // clears the busy flag. The output is already collected on the panel.
+  function releaseInvestigate(watchdogFired) {
+    var t = root._investigateTask
+    root._investigateTask = null
+    root._investigateRunning = false
+    if (!t) return
+    if (watchdogFired) {
+      console.warn("LensGuard: investigate probe hung; giving up (click again to retry)")
+      try { t.signal(9) } catch (error) { /* object may be gone */ }
+      try { t.running = false } catch (error) { /* ditto */ }
+      root._investigatePid = ""
+      root._investigateOutput = ""
+    }
+    t.released = true
+    t.destroy()
+  }
+
+  function handleInvestigateExited(task, exitCode) {
+    if (!task || task.released) return
+    if (root._investigateTask !== task) {
+      // The watchdog already dropped this run.
+      task.released = true
+      task.destroy()
+      return
+    }
+    investigateWatchdog.stop()
+    root.releaseInvestigate(false)
   }
 
   KeyboardPanel {
@@ -786,16 +828,31 @@ Panel {
     }
   }
 
-  Process {
-    id: investigateProc
-    command: []
-    stdout: StdioCollector {
-      id: investigateStdout
-      waitForEnd: true
-      onStreamFinished: root._investigateOutput = text.trim()
+  // Investigate Process factory: a FRESH Process object per click (MI-5
+  // rule — a long-lived reused Process can lose an exit event and report
+  // running forever, blocking every later "Investigate"). The watchdog Timer
+  // caps a run so a wedged object or a hung /proc read can never wedge the
+  // panel: after the budget the child is killed and the busy flag cleared.
+  Component {
+    id: investigateTaskComponent
+    Process {
+      id: investigateTaskProc
+      property bool released: false
+      command: []
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: root._investigateOutput = text.trim()
+      }
+      onExited: function(exitCode) {
+        root.handleInvestigateExited(investigateTaskProc, exitCode)
+      }
     }
-    onExited: function(exitCode) {
-      root._investigateRunning = false
-    }
+  }
+
+  Timer {
+    id: investigateWatchdog
+    interval: Model.WRITE_WATCHDOG_MS
+    repeat: false
+    onTriggered: root.releaseInvestigate(true)
   }
 }

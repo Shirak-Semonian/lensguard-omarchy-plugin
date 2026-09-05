@@ -36,6 +36,10 @@ var MIN_POLL_INTERVAL_MS = 250;        // user-configurable floor (never faster)
 var MAX_POLL_INTERVAL_MS = 5000;       // user-configurable ceiling (calm)
 var ERROR_RECHECK_MS = 5000;           // calm re-check cadence in error state
 var PROBE_WATCHDOG_MS = 5000;          // kill a probe that hangs this long
+var WRITE_WATCHDOG_MS = 5000;          // kill a one-shot write (state/config/reset) that hangs
+var NOTIF_WATCHDOG_MS = 10000;         // notification gate + send watchdog budget (ms)
+var NOTIF_GATE_TTL_S = 25;             // twin-instance skip window for the gate (s)
+var NOTIF_GATE_FLOCK_WAIT_S = 3;       // bounded flock wait in the gate (s)
 var PROBE_ERROR_AFTER = 2;             // consecutive transient failures -> error
 var MAX_OUTPUT_CHARS = 65536;          // parser cap (64 KiB), defensive
 
@@ -1030,11 +1034,11 @@ function intervalLabel(ms) {
 // reopened process with the same pid+command still notifies).
 function notifGateCommandArgs(stateFile, key, instanceId, ttlSeconds) {
   var ttl = Number(ttlSeconds);
-  if (!isFinite(ttl) || ttl < 1) ttl = 25;
+  if (!isFinite(ttl) || ttl < 1) ttl = NOTIF_GATE_TTL_S;
   var script = "f=$1; key=$2; me=$3; ttl=$4;"
     + " dir=$(dirname -- \"$f\"); mkdir -p -- \"$dir\" 2>/dev/null || { echo skip; exit 0; };"
     + " lock=\"$f.lock\"; exec 9>\"$lock\" || { echo skip; exit 0; };"
-    + " flock 9 2>/dev/null || { echo skip; exit 0; };"
+    + " flock -w " + NOTIF_GATE_FLOCK_WAIT_S + " 9 2>/dev/null || { echo skip; exit 0; };"
     + " now=$(date +%s); prev=\"\"; prevme=\"\"; prevts=0;"
     + " if [ -f \"$f\" ]; then read -r prev prevme prevts < \"$f\" 2>/dev/null || true; fi;"
     + " if [ \"$prev\" = \"$key\" ] && [ -n \"$prevme\" ] && [ \"$prevme\" != \"$me\" ]"
@@ -1067,6 +1071,10 @@ if (typeof module !== "undefined") {
     MAX_POLL_INTERVAL_MS: MAX_POLL_INTERVAL_MS,
     ERROR_RECHECK_MS: ERROR_RECHECK_MS,
     PROBE_WATCHDOG_MS: PROBE_WATCHDOG_MS,
+    WRITE_WATCHDOG_MS: WRITE_WATCHDOG_MS,
+    NOTIF_WATCHDOG_MS: NOTIF_WATCHDOG_MS,
+    NOTIF_GATE_TTL_S: NOTIF_GATE_TTL_S,
+    NOTIF_GATE_FLOCK_WAIT_S: NOTIF_GATE_FLOCK_WAIT_S,
     PROBE_ERROR_AFTER: PROBE_ERROR_AFTER,
     MAX_OUTPUT_CHARS: MAX_OUTPUT_CHARS,
     ERR_NO_TOOL: ERR_NO_TOOL,
