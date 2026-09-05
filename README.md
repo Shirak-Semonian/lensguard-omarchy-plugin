@@ -4,8 +4,8 @@ Camera activity guard for the Omarchy bar. LensGuard watches which process
 holds the webcam (`/dev/video*`) open and shows it clearly in the bar:
 calm when the camera is idle, yellow when a known app (whitelisted) uses it,
 red when an UNKNOWN process opens it — with a desktop notification, a tooltip
-that names the process, and a panel with live details, history and whitelist
-management. Built for people who want to *know* when their webcam is being
+that names the process, and a panel with live details, history, whitelist and
+settings. Built for people who want to *know* when their webcam is being
 used.
 
 > **Privacy first:** LensGuard never opens the camera, records nothing, sends
@@ -30,12 +30,20 @@ module, no service, no privileged daemon.
 
 ## Statuses
 
+The bar glyph is a camera lens inside a security shield on a calm navy tile
+(same family as the other Omarchy system-plugin icons). Its colour carries
+the state — the optional process name appears next to it while the camera is
+in use (`showProcessInBar`, off in `compactMode`):
+
 | Bar glyph | State | Meaning |
 | --- | --- | --- |
-| Grey camera | idle | No process holds the camera open. |
-| Yellow camera | known app | A whitelisted app uses the camera; calm, no alert. |
-| Red camera | unknown process | A process NOT on the whitelist opened the camera; LensGuard notifies you once and shows an attention card in the panel. |
-| Amber camera | detection unavailable | Tools missing (`lsof`/`fuser`) or no camera device found. LensGuard re-checks calmly every 5 s and recovers automatically. |
+| Steel shield+lens | idle | No process holds the camera open. |
+| Yellow shield+lens | known app | A whitelisted app uses the camera; calm, no alert. |
+| Red shield+lens | unknown process | A process NOT on the whitelist opened the camera; LensGuard notifies you once and shows an attention card in the panel. |
+| Soft-orange shield+lens | detection unavailable | Tools missing (`lsof`/`fuser`) or no camera device found. LensGuard re-checks calmly every 5 s and recovers automatically. |
+
+State changes cross-fade smoothly (no hard icon pops), and the icon reads on
+both light and dark bars because the tile keeps its own contrast.
 
 Click (left/right) toggles the panel: live status + process cards (command,
 PID, user, device, since when), the event history and the whitelist. Middle
@@ -49,7 +57,9 @@ LensGuard is watching are reported.
 ## Notifications
 
 When a process that is **not** on the whitelist opens the camera, LensGuard
-sends exactly one desktop notification per open:
+sends exactly one desktop notification per open (both notification settings —
+`notifyOnOpen`, `notifyOnUnknown` — are on by default; see “Whitelist &
+settings”):
 
 > **LensGuard: camera opened by `<command>` (PID `x`)**
 
@@ -57,22 +67,42 @@ plus a journal line. Whitelisted apps are calm (yellow “known app”, no
 notification). When the camera closes there is no popup — the tooltip quietly
 notes who released it.
 
-## Whitelist
+## Whitelist & settings
 
-`~/.config/lensguard/config.json` (created on first change, mode 600 from the
-first byte):
+Everything lives in `~/.config/lensguard/config.json` (created on first
+change, mode 600 from the first byte):
 
 ```json
 {
-  "whitelist": ["zoom", "obs", "teams", "chrome", "firefox", "…"]
+  "whitelist": ["zoom", "obs", "teams", "chrome", "firefox", "…"],
+  "pollIntervalMs": 1000,
+  "notifyOnOpen": true,
+  "notifyOnUnknown": true,
+  "showProcessInBar": true,
+  "compactMode": false
 }
 ```
 
-Defaults cover the common camera apps (Zoom, OBS, Teams, Chrome, Chromium,
-Firefox, PipeWire, …). Whitelist entries match the process command name:
-`teams` matches `teams` and `teams-for-linux`; an unknown process can be added
-from the panel (“Allow”) or removed again (“Deny”). A missing, empty or
-broken config simply falls back to the defaults — the guard never stops.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `whitelist` | common camera apps | Commands that may use the lens without an alert (calm yellow “known app”). |
+| `pollIntervalMs` | `1000` | Probe cadence, clamped to 250–5000 ms. |
+| `notifyOnOpen` | `true` | Master switch for the camera-open desktop notification. |
+| `notifyOnUnknown` | `true` | When off, unknown opens stay red in the bar/panel but do not pop up. |
+| `showProcessInBar` | `true` | While the camera is in use, show the process name next to the icon. |
+| `compactMode` | `false` | Icon only — never show text in the bar. |
+
+Missing keys fall back to the defaults automatically. A missing, empty or
+broken config simply uses the defaults — the guard never stops. When a file
+is broken the panel shows a calm note (never the file content) with one-click
+**Reset to defaults**: fresh defaults are written atomically (mode 600) and
+the broken file is kept as `config.json.bak`. The same reset is available
+over shell IPC (`resetConfig`). All settings are also editable from the
+panel's **Settings** section — no JSON editing needed.
+
+Whitelist entries match the process command name: `teams` matches `teams` and
+`teams-for-linux`; an unknown process can be added from the panel (“Allow”)
+or removed again (“Deny”).
 
 ## State
 
@@ -108,7 +138,10 @@ omarchy restart shell
 
 ## Polling behaviour
 
-- One probe per second at most, one probe in flight at a time.
+- Probe cadence follows `pollIntervalMs` (default 1 s, clamped 250–5000 ms):
+  one probe in flight at a time, never faster than the configured interval.
+- The heartbeat runs at `min(interval, 1 s)` so a fast setting is honoured
+  promptly; the tick gate still guarantees no below-minimum polling.
 - Every probe runs on a fresh process object; nothing is left behind.
 - Every probe is bounded by a 5 s watchdog (kill + rebuild if a probe ever
   hangs), so one wedged probe can never stall the widget.
@@ -126,13 +159,14 @@ Layout (same architecture as the other Omarchy widgets by the same author):
 
 - `Model.js` — pure logic shared by the QML and the Node tests: probe script,
   `lsof -F`/`fuser -v` parsers, process-level opened/closed events, whitelist
-  matching, config/state parsing and notification rules. No shell, no Qt, no
-  Node built-ins.
-- `BarWidget.qml` — the compact bar widget: 1 s heartbeat, probe lifecycle,
-  watchdog, config watcher, state-file persistence, notification dispatch,
-  state → glyph/tooltip mapping, panel routing.
+  matching, config/state parsing (incl. interval clamping + strict settings)
+  and notification rules. No shell, no Qt, no Node built-ins.
+- `BarWidget.qml` — the compact bar widget: heartbeat, probe lifecycle,
+  watchdog, config watcher + settings writes + reset, state-file persistence,
+  notification dispatch, state → glyph/tooltip mapping, panel routing.
 - `Panel.qml` — the details panel: live status, per-process cards with
-  Allow/Investigate, event history, whitelist management.
+  Allow/Investigate, event history, whitelist management and the Settings
+  section (interval, notifications, bar text, reset).
 - `test-model.js` — plain-`assert` Node tests, including real probe captures.
 - `assets/` — icons (idle/known/unknown/error) and the dummy preview.
 - `icon-source.svg`, `preview-source.svg` — editable artwork sources.

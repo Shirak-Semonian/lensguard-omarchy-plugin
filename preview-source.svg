@@ -32,16 +32,9 @@
   <circle cx="1338" cy="26" r="9" fill="#ffffff22"/>
   <rect x="1360" y="18" width="16" height="16" rx="3" fill="#a3be8c" opacity="0.85"/>
 
-  <!-- the LensGuard widget in the bar: red (active) camera glyph + dot -->
-  <g transform="translate(1396,10) scale(1.3)">
-    <g fill="none" stroke="#bf616a" stroke-width="5.4" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M5.2 12 v-1.2 a1.9 1.9 0 0 1 1.9-1.9 h3.8 a1.9 1.9 0 0 1 1.9 1.9 v1.2"/>
-      <rect x="1" y="12" width="14" height="9.4" rx="2.2"/>
-      <circle cx="8" cy="16.7" r="2.3"/>
-      <circle cx="12.6" cy="14" r="0.8" fill="#bf616a" stroke="none"/>
-    </g>
-  </g>
-  <circle cx="1418" cy="40" r="2.4" fill="#bf616a"/>
+  <!-- the LensGuard widget in the bar: definitive red (unknown-active) state
+       icon — camera lens + shield on the calm tile, same as in the bar -->
+  <image x="1395" y="9" width="22" height="22" href="assets/icon-active.png"/>
 
   <!-- panel mock (LensGuard popup) -->
   <g transform="translate(520,96)">
@@ -49,13 +42,7 @@
     <!-- header -->
     <g transform="translate(24,24)">
       <rect width="34" height="34" rx="8" fill="#14181e"/>
-      <g transform="translate(11,11) scale(0.92)">
-        <g fill="none" stroke="#d8dee9" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M4 8 v-0.8 a1.5 1.5 0 0 1 1.5-1.5 h3 a1.5 1.5 0 0 1 1.5 1.5 v0.8"/>
-          <rect x="0.6" y="8" width="12" height="8.2" rx="1.9"/>
-          <circle cx="6.6" cy="12.1" r="2"/>
-        </g>
-      </g>
+      <image x="1" y="1" width="32" height="32" href="assets/icon-active.png"/>
       <text x="46" y="15" font-family="sans-serif" font-size="15" font-weight="700" fill="#e8ecf2">LensGuard</text>
       <text x="46" y="29" font-family="sans-serif" font-size="10.5" fill="#8b93a1">Camera activity guard</text>
       <rect x="300" y="6" width="76" height="20" rx="10" fill="#bf616a" opacity="0.16"/>

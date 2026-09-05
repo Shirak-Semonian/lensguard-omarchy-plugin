@@ -1,15 +1,36 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <!-- LensGuard camera glyph — line icon. Neutral (idle) state.
-       The active and error PNGs are the same artwork with the stroke
-       colour swapped (#bf616a / #ebcb8b). -->
-  <g fill="none" stroke="#d8dee9" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
-    <!-- top roof (viewfinder bump) -->
-    <path d="M44 36 v-8 a10 10 0 0 1 10-10 h20 a10 10 0 0 1 10 10 v8"/>
-    <!-- body -->
-    <rect x="16" y="34" width="96" height="60" rx="12"/>
-    <!-- lens -->
-    <circle cx="64" cy="64" r="14"/>
-    <!-- record dot -->
-    <circle cx="97" cy="52" r="3.5" fill="#d8dee9" stroke="none"/>
+  <!-- LensGuard definitive icon (LG-3): camera lens + shield on a calm navy
+       tile, consistent with the other Omarchy system-plugin icons
+       (MyIP / DeepSpend). One artwork, four state colours — the PNG files in
+       assets/ are this file rendered with STROKE swapped:
+         assets/icon.png        (idle)    stroke #B4C5D8  soft steel
+         assets/icon-known.png  (known)   stroke #E6C384  calm yellow
+         assets/icon-active.png (unknown) stroke #BF616A  soft red
+         assets/icon-error.png  (error)   stroke #D08770  soft orange
+       Regenerate with rsvg-convert after editing (128x128). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#384964"/>
+      <stop offset="0.55" stop-color="#2E3C52"/>
+      <stop offset="1" stop-color="#202C40"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Calm navy tile, consistent with the other Omarchy system-plugin icons -->
+  <rect x="2" y="2" width="124" height="124" rx="28" fill="url(#bg)"/>
+
+  <!-- Security-shield silhouette holding a camera lens -->
+  <g fill="none" stroke="#B4C5D8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M64 26
+             C 74 26, 82 30, 87 37
+             C 92 44, 94 52, 94 62
+             C 94 76, 84 88, 64 102
+             C 44 88, 34 76, 34 62
+             C 34 52, 36 44, 41 37
+             C 46 30, 54 26, 64 26 Z"/>
+    <circle cx="64" cy="64" r="15"/>
   </g>
+
+  <!-- Lens glass / aperture centre -->
+  <circle cx="64" cy="64" r="4" fill="#B4C5D8"/>
 </svg>

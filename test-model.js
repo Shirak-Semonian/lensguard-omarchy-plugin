@@ -179,6 +179,87 @@ has(wc[2], "config.json.tmp.$$", "config write uses a temp file")
 has(wc[2], "mv -f", "config write is atomic")
 has(wc[2], "printf '%s' \"$2\"", "content travels as argv, never shell text")
 
+// --- LG-3 config keys: defaults -------------------------------------------
+const defCfg = M.defaultConfig()
+eq(defCfg.pollIntervalMs, 1000, "default poll interval is 1000 ms")
+eq(defCfg.notifyOnOpen, true, "default notifyOnOpen true")
+eq(defCfg.notifyOnUnknown, true, "default notifyOnUnknown true")
+eq(defCfg.showProcessInBar, true, "default showProcessInBar true")
+eq(defCfg.compactMode, false, "default compactMode false")
+eq(M.MIN_POLL_INTERVAL_MS, 250, "poll floor is 250 ms")
+eq(M.MAX_POLL_INTERVAL_MS, 5000, "poll ceiling is 5000 ms")
+eq(M.clampPollInterval(250), 250, "clamp keeps 250")
+eq(M.clampPollInterval(5000), 5000, "clamp keeps 5000")
+eq(M.clampPollInterval(1000), 1000, "clamp keeps the default")
+eq(M.clampPollInterval(10), 250, "clamp lifts below-min to the floor")
+eq(M.clampPollInterval(99999), 5000, "clamp drops above-max to the ceiling")
+eq(M.clampPollInterval(333.6), 334, "clamp rounds to whole ms")
+eq(M.clampPollInterval("junk"), 1000, "clamp falls back to the default")
+
+// --- LG-3 config keys: parsing + strict validation ------------------------
+cfg = M.parseConfig('{"pollIntervalMs": 250}')
+eq(cfg.ok, true, "fast interval accepted")
+eq(cfg.config.pollIntervalMs, 250, "fast interval parsed")
+cfg = M.parseConfig('{"pollIntervalMs": 25}')
+eq(cfg.ok, true, "below-min interval is tolerated (clamped, not an error)")
+eq(cfg.config.pollIntervalMs, 250, "below-min interval clamps to the floor")
+cfg = M.parseConfig('{"pollIntervalMs": 60000}')
+eq(cfg.config.pollIntervalMs, 5000, "above-max interval clamps to the ceiling")
+cfg = M.parseConfig('{"pollIntervalMs": "1000"}')
+eq(cfg.ok, false, "string interval is a field error")
+eq(cfg.kind, "field", "string interval kind")
+cfg = M.parseConfig('{"notifyOnUnknown": false}')
+eq(cfg.ok, true, "boolean false accepted")
+eq(cfg.config.notifyOnUnknown, false, "notifyOnUnknown false parsed")
+cfg = M.parseConfig('{"compactMode": true}')
+eq(cfg.config.compactMode, true, "compactMode true parsed")
+cfg = M.parseConfig('{"notifyOnOpen": "yes"}')
+eq(cfg.ok, false, "non-boolean notifyOnOpen is a field error")
+eq(cfg.kind, "field", "notifyOnOpen kind")
+has(cfg.message, "true or false", "field error is static and descriptive")
+cfg = M.parseConfig('{"compactMode": 1}')
+eq(cfg.ok, false, "non-boolean compactMode is a field error")
+cfg = M.parseConfig('{}')
+eq(cfg.ok, true, "empty object -> defaults")
+eq(cfg.config.pollIntervalMs, 1000, "empty object keeps default interval")
+eq(cfg.config.notifyOnOpen, true, "empty object keeps default notifyOnOpen")
+// A minimal old-format whitelist-only file stays valid and fills defaults.
+cfg = M.parseConfig('{"whitelist": ["zoom"]}')
+eq(cfg.ok, true, "old whitelist-only file is still valid")
+eq(cfg.config.pollIntervalMs, 1000, "old file gets the default interval")
+eq(cfg.config.notifyOnUnknown, true, "old file gets the default notify flag")
+eq(cfg.config.compactMode, false, "old file gets the default compact mode")
+// Full round-trip: every known key survives a parse -> text -> parse cycle.
+const fullCfg = { whitelist: ["zoom", "obs"], pollIntervalMs: 2000,
+  notifyOnOpen: false, notifyOnUnknown: true, showProcessInBar: false, compactMode: true }
+const fullText = M.configToText(fullCfg, { customNote: 7 })
+const fullParsed = M.parseConfig(fullText)
+eq(fullParsed.ok, true, "round-tripped config parses")
+eq(fullParsed.config.pollIntervalMs, 2000, "interval survives round-trip")
+eq(fullParsed.config.notifyOnOpen, false, "notifyOnOpen survives round-trip")
+eq(fullParsed.config.compactMode, true, "compactMode survives round-trip")
+has(fullText, "customNote", "unknown keys survive a settings write")
+const tmpl = M.configTemplateText()
+has(tmpl, "pollIntervalMs", "template includes pollIntervalMs")
+has(tmpl, "notifyOnUnknown", "template includes notifyOnUnknown")
+has(tmpl, "showProcessInBar", "template includes showProcessInBar")
+has(tmpl, "compactMode", "template includes compactMode")
+
+// --- LG-3 config reset: .bak + defaults -----------------------------------
+const rc = M.configResetCommandArgs("/x/lensguard/config.json")
+eq(rc[0], "bash", "reset via bash")
+has(rc[2], "cp -f", "reset keeps a .bak backup of the current file")
+has(rc[2], "$f.bak", "backup path is config.json.bak")
+has(rc[2], "umask 077", "reset writes mode 600 from the first byte")
+has(rc[2], "mv -f", "reset write is atomic")
+has(rc[2], "echo ok", "reset reports success")
+
+// --- interval label --------------------------------------------------------
+eq(M.intervalLabel(250), "250 ms", "interval label ms")
+eq(M.intervalLabel(1000), "1 s", "interval label seconds")
+eq(M.intervalLabel(1500), "1.5 s", "interval label fractional")
+eq(M.intervalLabel(5000), "5 s", "interval label 5 s")
+
 // --- state reducer: baseline is silent ----------------------------------
 let v = M.initialView()
 eq(v.status, "loading", "starts loading")
@@ -387,6 +468,15 @@ const notifProc = { pid: "9001", command: "ffmpeg", user: "demo", devices: ["/de
 eq(M.shouldNotifyOnOpen(notifProc, M.DEFAULT_WHITELIST), true, "unknown process should notify")
 eq(M.shouldNotifyOnOpen({ pid: "1", command: "zoom" }, M.DEFAULT_WHITELIST), false,
   "whitelisted process stays calm")
+eq(M.shouldNotifyOnOpen(notifProc, M.DEFAULT_WHITELIST, { notifyOnOpen: true, notifyOnUnknown: true }),
+  true, "config defaults keep unknown notifications on")
+eq(M.shouldNotifyOnOpen(notifProc, M.DEFAULT_WHITELIST, { notifyOnOpen: false, notifyOnUnknown: true }),
+  false, "notifyOnOpen false silences camera-open notifications")
+eq(M.shouldNotifyOnOpen(notifProc, M.DEFAULT_WHITELIST, { notifyOnOpen: true, notifyOnUnknown: false }),
+  false, "notifyOnUnknown false silences only the unknown alert")
+eq(M.shouldNotifyOnOpen({ pid: "1", command: "zoom" }, M.DEFAULT_WHITELIST,
+  { notifyOnOpen: true, notifyOnUnknown: false }), false,
+  "whitelisted app stays calm even when unknown alerts are off")
 has(M.notifySummary(notifProc), "ffmpeg", "summary names the command")
 has(M.notifySummary(notifProc), "9001", "summary names the PID")
 const ng = M.notifGateCommandArgs("/tmp/lg.gate", "opened|9001", "inst-A", 25)
@@ -394,6 +484,26 @@ eq(ng[0], "bash", "gate via bash")
 has(ng[2], "flock", "gate uses flock")
 has(ng[2], "prevme", "gate is instance-aware (a twin is skipped, self is not)")
 has(ng[2], "echo skip", "gate can skip (twin instance)")
+
+// --- bar process text (showProcessInBar / compactMode) --------------------
+const idleView2 = { status: "idle", users: [], errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null, history: [], openedAt: {} }
+eq(M.barProcessText(idleView2, M.DEFAULT_WHITELIST), "", "idle -> no bar text")
+eq(M.barProcessText(M.initialView(), M.DEFAULT_WHITELIST), "", "loading -> no bar text")
+const oneProcView = { status: "active", users: [{ device: "/dev/video0", pid: "10", user: "demo", command: "zoom" }],
+  openedAt: { "10": 1 }, history: [], lastEvent: null }
+eq(M.barProcessText(oneProcView, M.DEFAULT_WHITELIST), "zoom", "one known process -> its name")
+const unknownView = { status: "active", users: [
+  { device: "/dev/video0", pid: "10", user: "demo", command: "zoom" },
+  { device: "/dev/video0", pid: "11", user: "demo", command: "ffmpeg" }],
+  openedAt: { "10": 1, "11": 2 }, history: [], lastEvent: null }
+eq(M.barProcessText(unknownView, M.DEFAULT_WHITELIST), "ffmpeg +1",
+  "unknown process wins the bar label and the rest become a count")
+const allKnownView = { status: "active", users: [
+  { device: "/dev/video0", pid: "10", user: "demo", command: "zoom" },
+  { device: "/dev/video0", pid: "12", user: "demo", command: "obs" }],
+  openedAt: { "10": 1, "12": 2 }, history: [], lastEvent: null }
+eq(M.barProcessText(allKnownView, M.DEFAULT_WHITELIST), "zoom +1",
+  "all-known multi-process label shows the first plus the count")
 
 // --- entryKey / diffUsers direct (device-level helper retained) ----------
 eq(M.entryKey(holderA[0]), "/dev/video0|4102", "entry key device|pid")

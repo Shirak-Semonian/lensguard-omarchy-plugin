@@ -7,12 +7,14 @@ import "Model.js" as Model
 
 // LensGuard — camera (webcam) activity guard.
 //
-// The bar shows only a compact camera glyph whose colour carries the state:
-// calm grey when the camera is idle, yellow when a KNOWN app (whitelisted)
-// holds /dev/video* open, red when an UNKNOWN process opens it, amber when
-// detection cannot run (tools missing / no camera device). Hovering gives a
-// tooltip that names the process(es) using the camera. Left/right click
-// toggles the small panel; middle click forces an immediate re-check.
+// The bar shows only a compact camera+shield glyph whose colour carries the
+// state: calm steel when the camera is idle, yellow when a KNOWN app
+// (whitelisted) holds /dev/video* open, red when an UNKNOWN process opens it,
+// soft orange when detection cannot run (tools missing / no camera device).
+// The process name appears next to the icon only while the camera is in use
+// (LG-3: showProcessInBar, disabled by compactMode). Hovering gives a tooltip
+// that names the process(es) using the camera. Left/right click toggles the
+// small panel; middle click forces an immediate re-check.
 //
 // LG-2 behaviour:
 //   * Whitelist lives in ~/.config/lensguard/config.json (mode 600 from the
@@ -28,10 +30,26 @@ import "Model.js" as Model
 //     poll after startup is a silent baseline, so a restart while the camera
 //     is open never re-alarms (MyIP lesson).
 //
+// LG-3 behaviour (config, settings, UX polish):
+//   * The same config file now carries pollIntervalMs (clamped 250..5000 ms),
+//     notifyOnOpen / notifyOnUnknown / showProcessInBar / compactMode plus the
+//     whitelist. Missing keys -> defaults; a broken file -> calm defaults, a
+//     calm panel note and a one-click Reset that restores defaults (mode 600)
+//     and keeps the broken file as config.json.bak. Reset is also exposed
+//     over shell IPC (resetConfig).
+//   * The poll cadence honours pollIntervalMs; the heartbeat only ever runs
+//     at most once per interval tick and never polls below the 250 ms floor.
+//   * Notifications honour notifyOnOpen/notifyOnUnknown; a whitelisted app is
+//     always calm.
+//   * Definitive state icon set (camera lens + shield on a calm tile) with a
+//     smooth cross-fade between states; bar text only when the camera is in
+//     use.
+//
 // Detection: one cheap probe per second asks lsof (fallback fuser) which
 // processes hold /dev/video* open. No polling spam by construction:
-//   * at most ONE probe in flight, at most one per second
-//     (Model.DEFAULT_POLL_INTERVAL_MS) — the tick gate + _activePoll guard;
+//   * at most ONE probe in flight, at most one per configured interval
+//     (Model.clampPollInterval(config.pollIntervalMs), default 1000 ms) — the
+//     tick gate + _activePoll guard;
 //   * every probe runs on a *fresh* Process object (created per probe,
 //     destroyed on exit). A single long-lived Quickshell Process reused many
 //     times can lose an exit event and then report running forever, silently
@@ -46,7 +64,7 @@ import "Model.js" as Model
 //     epoch check) is dropped.
 //
 // Probe self-heal (watchdog): a healthy probe finishes in milliseconds. The
-// 1 s heartbeat checks that a running probe never exceeds
+// heartbeat checks that a running probe never exceeds
 // Model.PROBE_WATCHDOG_MS (5 s). If it does, the exit event was lost or the
 // child hung: the watchdog SIGKILLs the child, and if the Process still does
 // not report an exit shortly after, the wedged Process object is dropped and
@@ -105,6 +123,13 @@ BarWidget {
   property int _pollRecoveries: 0
   property string _logKey: ""
 
+  // Icon cross-fade state (two stacked layers, see advanceIcon()).
+  property bool _iconReady: false
+  property int _iconLayer: 0
+  property string _lastIconSource: ""
+  // UI children (timer etc.) exist and live config changes may touch them.
+  property bool _uiReady: false
+
   // ---- notification queue (serialized + cross-instance gate) -------------
   property var _notifQueue: []
   property var _notifPending: null
@@ -116,8 +141,12 @@ BarWidget {
   // ---- display helpers ---------------------------------------------------
   readonly property color foreground: bar ? bar.barForeground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
+  // Calm state palette (LG-3): the bar glyph, the process label and the
+  // panel share these hues so a state reads identically everywhere.
+  readonly property color calm: "#a3be8c"   // calm/ok accents (panel)
   readonly property color danger: "#bf616a" // unknown process / camera in use
-  readonly property color warn: "#ebcb8b"   // known app / calm
+  readonly property color warn: "#e6c384"   // known app / calm
+  readonly property color notice: "#d08770" // detection unavailable (error)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property bool isLoading: Model.isLoading(root.view)
@@ -126,12 +155,25 @@ BarWidget {
   readonly property bool isError: Model.isError(root.view)
   readonly property bool hasUnknown: Model.anyUnknown(root.view, root.whitelist)
 
-  // Bar glyph per state: grey idle, yellow known-app, red unknown, amber
-  // detection problem.
+  // Effective poll interval from the config (clamped 250..5000 ms). Changing
+  // the config value live re-schedules the polling heartbeat (applyConfig).
+  readonly property int pollIntervalMs: Model.clampPollInterval(
+    root.config.pollIntervalMs)
+
+  // Bar glyph per state: steel idle, yellow known-app, red unknown, soft
+  // orange detection problem (see assets/icon-*.png).
   readonly property string statusIcon: root.isActive
     ? (root.hasUnknown ? "assets/icon-active.png" : "assets/icon-known.png")
     : (root.isError ? "assets/icon-error.png" : "assets/icon.png")
   readonly property real iconOpacity: root.isLoading ? 0.55 : 1.0
+
+  // Bar text policy (LG-3): only while the camera is in use, only when the
+  // user enabled it, never in compact mode (icon only). The label names the
+  // process that matters most (unknown wins) + a count of the rest.
+  readonly property bool processTextEnabled: root.config.showProcessInBar !== false
+    && root.config.compactMode !== true
+  readonly property string processBarText: root.isActive
+    ? Model.barProcessText(root.view, root.whitelist) : ""
 
   readonly property string widgetTooltip: {
     var text = Model.tooltipText(root.view, Date.now())
@@ -140,6 +182,9 @@ BarWidget {
     }
     return text
   }
+
+  // A state flip changes the glyph; cross-fade it instead of popping it.
+  onStatusIconChanged: root.advanceIcon()
 
   // ---- panel popup -------------------------------------------------------
   // Shape contract for shell summon/hide/toggle routing:
@@ -180,6 +225,23 @@ BarWidget {
     root.tick()
   }
 
+  // Cross-fade the state glyph between two stacked image layers whenever the
+  // state icon changes: the previously hidden layer loads the new icon and
+  // fades in while the old one fades out (both have a Behavior on opacity),
+  // so a status flip reads as a smooth transition, never a hard pop.
+  function advanceIcon() {
+    if (!root._iconReady) return
+    var next = root.statusIcon
+    if (!next || next === root._lastIconSource) return
+    root._lastIconSource = next
+    var showLayer = (root._iconLayer === 0) ? iconLayerB : iconLayerA
+    var hideLayer = (root._iconLayer === 0) ? iconLayerA : iconLayerB
+    showLayer.source = Qt.resolvedUrl(next)
+    showLayer.opacity = 1
+    hideLayer.opacity = 0
+    root._iconLayer = (root._iconLayer === 0) ? 1 : 0
+  }
+
   // ---- config handling ---------------------------------------------------
   // The config file is optional. Missing or broken -> calm defaults; the
   // camera guard never stops working because of a config typo.
@@ -194,31 +256,48 @@ BarWidget {
       root.config = Model.defaultConfig()
       root._configRaw = null
       console.warn("LensGuard: config problem (" + parsed.kind + ") — using defaults")
+      root.applyPollIntervalChange()
       return
     }
     root.configErrorKind = ""
     root.config = parsed.config
     root._configRaw = parsed.raw || null
+    root.applyPollIntervalChange()
+  }
+
+  // Keep the heartbeat cadence in sync with the configured poll interval.
+  // The heartbeat interval is min(pollInterval, 1 s) so fast settings are
+  // honoured promptly; the tick gate + _dueAt still prevent any polling
+  // below the configured floor. Called whenever the config changes and once
+  // at startup (Component.onCompleted) for configs read before the UI ready.
+  function applyPollIntervalChange() {
+    if (!root._uiReady) return
+    var target = Math.max(100, Math.min(1000, root.pollIntervalMs))
+    if (pollTimer.interval === target) return
+    pollTimer.interval = target
+    root._dueAt = 0
+    pollTimer.restart()
   }
 
   function refreshConfig() {
     configFile.reload()
   }
 
-  // Add/remove a whitelist entry from the UI (panel Allow/Deny). Writes the
-  // config atomically, mode 600 from the first byte.
-  function setWhitelistEntry(command, allowed) {
-    if (!command) return
-    var name = String(command).trim().toLowerCase()
-    if (!name) return
-    var list = root.whitelist.slice()
-    var idx = list.indexOf(name)
-    if (allowed) {
-      if (idx === -1) list.push(name)
-    } else {
-      if (idx !== -1) list.splice(idx, 1)
+  // Generic config patch from the UI (panel Allow/Deny + settings). Merges
+  // the patch into the current in-memory config, then writes the FULL config
+  // atomically (mode 600 from the first byte) so no key is ever dropped. The
+  // user's unknown keys (raw) are preserved on write.
+  function setConfigPatch(patch) {
+    if (!patch || typeof patch !== "object") return
+    var base = root.config || Model.defaultConfig()
+    var cfg = {}
+    var key
+    for (key in base) {
+      if (Object.prototype.hasOwnProperty.call(base, key)) cfg[key] = base[key]
     }
-    var cfg = { whitelist: list }
+    for (key in patch) {
+      if (Object.prototype.hasOwnProperty.call(patch, key)) cfg[key] = patch[key]
+    }
     root._lastConfigRaw = ""
     root.config = cfg
     configWriteProc.command = Model.writeConfigCommandArgs(
@@ -226,8 +305,39 @@ BarWidget {
     configWriteProc.running = true
   }
 
+  function setConfigValue(key, value) {
+    var patch = {}
+    patch[key] = value
+    root.setConfigPatch(patch)
+  }
+
+  // Add/remove a whitelist entry from the UI (panel Allow/Deny). Writes the
+  // full config atomically, mode 600 from the first byte.
+  function setWhitelistEntry(command, allowed) {
+    if (!command) return
+    var name = String(command).trim().toLowerCase()
+    if (!name) return
+    var list = (root.config.whitelist || []).slice()
+    var idx = list.indexOf(name)
+    if (allowed) {
+      if (idx === -1) list.push(name)
+    } else {
+      if (idx !== -1) list.splice(idx, 1)
+    }
+    root.setConfigPatch({ whitelist: list })
+  }
+
   function allowCommand(command) { root.setWhitelistEntry(command, true) }
   function denyCommand(command) { root.setWhitelistEntry(command, false) }
+
+  // Reset the config to defaults (LG-3). The current file — even a broken
+  // one — is kept as config.json.bak by the reset script; fresh defaults are
+  // then written atomically, mode 600. Never echoes file content anywhere.
+  function resetConfigToDefaults() {
+    if (resetConfigProc.running) return
+    resetConfigProc.command = Model.configResetCommandArgs(root.configPath)
+    resetConfigProc.running = true
+  }
 
   // Open the whitelist config in the user's editor (Omarchy fixed helper;
   // argv only, no shell).
@@ -275,7 +385,7 @@ BarWidget {
     poll.destroy()
   }
 
-  // Probe watchdog (called from the 1 s heartbeat). A healthy probe finishes
+  // Probe watchdog (called from the heartbeat). A healthy probe finishes
   // in milliseconds, so a probe still "running" past Model.PROBE_WATCHDOG_MS
   // has lost its exit event or its child hung. First strike: SIGKILL the
   // child and wait briefly for the exit event. Second strike: the Process
@@ -286,7 +396,7 @@ BarWidget {
     var poll = root._activePoll
     if (!poll) return
     if (Date.now() < root._pollDeadlineAt) return
-    var intervalMs = Model.DEFAULT_POLL_INTERVAL_MS
+    var intervalMs = root.pollIntervalMs
     if (!root._pollKillSent) {
       root._pollKillSent = true
       console.warn("LensGuard: probe watchdog — probe did not finish within "
@@ -311,7 +421,7 @@ BarWidget {
 
   function handleProbeExited(poll, exitCode) {
     if (!poll) return
-    var intervalMs = Model.DEFAULT_POLL_INTERVAL_MS
+    var intervalMs = root.pollIntervalMs
     var killed = root._pollKillSent
     if (root._activePoll !== poll || poll.runEpoch !== root._epoch) {
       // Stale result: the watchdog already took over this run (killed +
@@ -364,12 +474,13 @@ BarWidget {
     }
     root.view = next
     root.persistState(next)
-    // One notification per real open by a non-whitelisted process; closed
-    // never notifies (tooltip carries the calm return note).
+    // One notification per real open by a non-whitelisted process — gated by
+    // the user's notifyOnOpen / notifyOnUnknown settings; closed events never
+    // notify (the tooltip carries the calm return note).
     for (var i = 0; i < events.length; i++) {
       var ev = events[i]
       if (ev.kind !== "opened") continue
-      if (!Model.shouldNotifyOnOpen(ev.process, root.whitelist)) continue
+      if (!Model.shouldNotifyOnOpen(ev.process, root.whitelist, root.config)) continue
       root.enqueueNotification(ev.process)
     }
     // Whatever the outcome, the next probe is a full interval away; in the
@@ -459,16 +570,19 @@ BarWidget {
   }
 
   // ---- layout ------------------------------------------------------------
-  // Reserve only the icon + the clickable margins; the bar slot matches the
-  // visible content (a compact glyph — no text in the bar).
-  implicitWidth: iconImage.width + Style.space(12)
+  // Reserve only the visible content + the clickable margins: a compact
+  // glyph (with optional process name while the camera is in use) — never
+  // empty reserved space.
+  implicitWidth: barContent.implicitWidth + Style.space(12)
   implicitHeight: root.barSize
 
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
 
-  // Heartbeat. Runs the tick gate once per second; tick() itself decides
-  // when a probe may actually start (idle process + interval elapsed).
+  // Heartbeat. Runs the tick gate at min(pollInterval, 1 s); tick() itself
+  // decides when a probe may actually start (idle process + interval
+  // elapsed), so the cadence always honours pollIntervalMs without ever
+  // polling below the 250 ms floor.
   Timer {
     id: pollTimer
     interval: 1000
@@ -569,9 +683,23 @@ BarWidget {
     command: []
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        console.warn("LensGuard: could not write the whitelist config")
+        console.warn("LensGuard: could not write the settings config")
         return
       }
+      root.refreshConfig()
+    }
+  }
+
+  // Atomic config reset (LG-3): keeps config.json.bak, writes defaults.
+  Process {
+    id: resetConfigProc
+    command: []
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        console.warn("LensGuard: could not reset the settings config")
+        return
+      }
+      console.log("LensGuard: settings reset to defaults (previous file kept as config.json.bak)")
       root.refreshConfig()
     }
   }
@@ -613,6 +741,15 @@ BarWidget {
   Component.onCompleted: {
     root._instanceId = String(Math.floor(Math.random() * 0x7fffffff))
       + "-" + String(Date.now())
+    // Start the icon cross-fade with the current state already in place.
+    root._lastIconSource = root.statusIcon
+    iconLayerA.source = Qt.resolvedUrl(root.statusIcon)
+    root._iconLayer = 0
+    root._iconReady = true
+    // The config may already have been read before the timer existed; sync
+    // the heartbeat cadence to the configured poll interval now.
+    root._uiReady = true
+    root.applyPollIntervalChange()
   }
 
   Loader {
@@ -637,10 +774,11 @@ BarWidget {
     function toggle(): void { root.togglePanel() }
     function allow(command) { root.allowCommand(command) }
     function deny(command) { root.denyCommand(command) }
+    function resetConfig() { root.resetConfigToDefaults() }
   }
 
-  // Full-size interaction layer with a hidden label; the camera glyph below
-  // (a plain visual — it does not consume mouse events) sits on top, so
+  // Full-size interaction layer with a hidden label; the content below (plain
+  // visuals — they do not consume mouse events) sits on top, so
   // hover/press/tooltip all still land on this button.
   WidgetButton {
     id: button
@@ -654,20 +792,75 @@ BarWidget {
     }
   }
 
-  Image {
-    id: iconImage
+  // Visible bar content: state glyph + (only while the camera is in use and
+  // the user allowed it) the process name. Both are plain visuals above the
+  // WidgetButton, so every mouse interaction stays on the button.
+  Row {
+    id: barContent
     anchors.centerIn: parent
-    width: 16
-    height: 16
-    source: Qt.resolvedUrl(root.statusIcon)
-    sourceSize.width: 128
-    sourceSize.height: 128
-    fillMode: Image.PreserveAspectFit
-    smooth: true
-    opacity: root.iconOpacity
+    spacing: Style.space(5)
 
-    Behavior on opacity {
-      NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+    // State glyph with a two-layer cross-fade (see advanceIcon()).
+    Item {
+      id: iconBox
+      width: 18
+      height: 18
+      opacity: root.iconOpacity
+
+      Behavior on opacity {
+        NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+      }
+
+      Image {
+        id: iconLayerA
+        anchors.fill: parent
+        source: ""
+        sourceSize.width: 128
+        sourceSize.height: 128
+        fillMode: Image.PreserveAspectFit
+        smooth: true
+        opacity: 1
+
+        Behavior on opacity {
+          NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+        }
+      }
+
+      Image {
+        id: iconLayerB
+        anchors.fill: parent
+        source: ""
+        sourceSize.width: 128
+        sourceSize.height: 128
+        fillMode: Image.PreserveAspectFit
+        smooth: true
+        opacity: 0
+
+        Behavior on opacity {
+          NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+        }
+      }
+    }
+
+    Text {
+      id: barProcessLabel
+      anchors.verticalCenter: parent.verticalCenter
+      visible: root.processTextEnabled && root.processBarText !== ""
+      text: root.processBarText
+      color: root.hasUnknown ? root.danger : root.warn
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      verticalAlignment: Text.AlignVCenter
+      elide: Text.ElideRight
+      maximumLineCount: 1
+      // A long command line must never stretch the bar slot; elide past a
+      // calm max width.
+      width: Math.min(implicitWidth, 150)
+
+      Behavior on color {
+        enabled: !root.bar || root.bar.foregroundAnimationEnabled
+        ColorAnimation { duration: 160 }
+      }
     }
   }
 }

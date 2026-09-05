@@ -31,8 +31,9 @@
 // stable marker line and the widget shows a calm error state instead of
 // spamming.
 
-var DEFAULT_POLL_INTERVAL_MS = 1000;   // poll about once per second (max)
-var MIN_POLL_INTERVAL_MS = 1000;       // never probe faster than this
+var DEFAULT_POLL_INTERVAL_MS = 1000;   // poll about once per second (default)
+var MIN_POLL_INTERVAL_MS = 250;        // user-configurable floor (never faster)
+var MAX_POLL_INTERVAL_MS = 5000;       // user-configurable ceiling (calm)
 var ERROR_RECHECK_MS = 5000;           // calm re-check cadence in error state
 var PROBE_WATCHDOG_MS = 5000;          // kill a probe that hangs this long
 var PROBE_ERROR_AFTER = 2;             // consecutive transient failures -> error
@@ -408,12 +409,57 @@ function isWhitelisted(command, whitelist) {
 // The config is optional. When it is missing, empty or broken the widget
 // quietly uses defaults — the camera guard must never stop working because
 // of a config typo. parseConfig returns
-//   { ok: true,  config: { whitelist: [...] }, source: "defaults"|"file" }
+//   { ok: true,  config: {...}, source: "defaults"|"file" }
 //   { ok: false, kind: "parse"|"shape"|"field", message, hint }
 // and never leaks file content into user-facing strings.
+//
+// Supported keys (LG-3):
+//   pollIntervalMs     number, clamped to [250, 5000]       (default 1000)
+//   notifyOnOpen       boolean                              (default true)
+//   notifyOnUnknown    boolean                              (default true)
+//   showProcessInBar   boolean                              (default true)
+//   compactMode        boolean                              (default false)
+//   whitelist          array of command patterns
+// Numbers are clamped into range; booleans are strict (a wrong type is a
+// calm field error -> defaults). Unknown keys are preserved on write.
 
 function defaultConfig() {
-  return { whitelist: DEFAULT_WHITELIST.slice() };
+  return {
+    whitelist: DEFAULT_WHITELIST.slice(),
+    pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+    notifyOnOpen: true,
+    notifyOnUnknown: true,
+    showProcessInBar: true,
+    compactMode: false
+  };
+}
+
+// Clamp a poll interval into the supported range. Used both while parsing
+// the config and whenever the widget schedules a probe.
+function clampPollInterval(ms) {
+  var n = Number(ms);
+  if (!isFinite(n)) return DEFAULT_POLL_INTERVAL_MS;
+  n = Math.round(n);
+  if (n < MIN_POLL_INTERVAL_MS) return MIN_POLL_INTERVAL_MS;
+  if (n > MAX_POLL_INTERVAL_MS) return MAX_POLL_INTERVAL_MS;
+  return n;
+}
+
+// Boolean config keys and their default value when the key is absent.
+var CONFIG_BOOL_DEFAULTS = {
+  notifyOnOpen: true,
+  notifyOnUnknown: true,
+  showProcessInBar: true,
+  compactMode: false
+};
+
+function configFieldError(key, message) {
+  return {
+    ok: false,
+    kind: "field",
+    message: message,
+    hint: "edit the config or reset it from the LensGuard panel"
+  };
 }
 
 function parseConfig(raw) {
@@ -429,7 +475,7 @@ function parseConfig(raw) {
       ok: false,
       kind: "parse",
       message: "config.json is not valid JSON",
-      hint: "edit or remove the file to use the defaults"
+      hint: "reset it from the LensGuard panel or edit the file"
     };
   }
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
@@ -437,35 +483,51 @@ function parseConfig(raw) {
       ok: false,
       kind: "shape",
       message: "config.json must contain a JSON object",
-      hint: "edit or remove the file to use the defaults"
+      hint: "reset it from the LensGuard panel or edit the file"
     };
   }
-  var whitelist = DEFAULT_WHITELIST.slice();
-  var raw = obj;
+  var cfg = defaultConfig();
+  var i;
   if (obj.whitelist !== undefined) {
     if (!Array.isArray(obj.whitelist)) {
-      return {
-        ok: false,
-        kind: "field",
-        message: "config: \"whitelist\" must be a list of app names",
-        hint: "edit or remove the file to use the defaults"
-      };
+      return configFieldError("whitelist",
+        "config: \"whitelist\" must be a list of app names");
     }
     var clean = [];
-    for (var i = 0; i < obj.whitelist.length; i++) {
+    for (i = 0; i < obj.whitelist.length; i++) {
       var item = obj.whitelist[i];
       if (typeof item !== "string") continue;
       var name = item.trim().toLowerCase();
       if (!name) continue;
       if (clean.indexOf(name) === -1) clean.push(name);
     }
-    whitelist = clean;
+    cfg.whitelist = clean;
   }
-  return { ok: true, config: { whitelist: whitelist }, source: "file", raw: raw };
+  if (obj.pollIntervalMs !== undefined) {
+    if (typeof obj.pollIntervalMs !== "number" || !isFinite(obj.pollIntervalMs)) {
+      return configFieldError("pollIntervalMs",
+        "config: \"pollIntervalMs\" must be a number between 250 and 5000");
+    }
+    cfg.pollIntervalMs = clampPollInterval(obj.pollIntervalMs);
+  }
+  for (var key in CONFIG_BOOL_DEFAULTS) {
+    if (!Object.prototype.hasOwnProperty.call(CONFIG_BOOL_DEFAULTS, key)) continue;
+    var value = obj[key];
+    if (value === undefined) {
+      cfg[key] = CONFIG_BOOL_DEFAULTS[key];
+    } else if (typeof value !== "boolean") {
+      return configFieldError(key,
+        "config: \"" + key + "\" must be true or false");
+    } else {
+      cfg[key] = value;
+    }
+  }
+  return { ok: true, config: cfg, source: "file", raw: obj };
 }
 
-// Serialized config content. Only known keys are written; everything else the
-// user typed is preserved verbatim so editing via UI never destroys settings.
+// Serialized config content. Only the known keys are written from config;
+// everything else the user typed is preserved verbatim so editing via UI
+// never destroys settings.
 function configToText(config, raw) {
   var obj = {};
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
@@ -473,12 +535,18 @@ function configToText(config, raw) {
       if (Object.prototype.hasOwnProperty.call(raw, key)) obj[key] = raw[key];
     }
   }
-  obj.whitelist = (config && config.whitelist) || [];
+  var cfg = config || defaultConfig();
+  obj.whitelist = cfg.whitelist || [];
+  obj.pollIntervalMs = clampPollInterval(cfg.pollIntervalMs);
+  obj.notifyOnOpen = cfg.notifyOnOpen !== false;
+  obj.notifyOnUnknown = cfg.notifyOnUnknown !== false;
+  obj.showProcessInBar = cfg.showProcessInBar !== false;
+  obj.compactMode = cfg.compactMode === true;
   return JSON.stringify(obj, null, 2) + "\n";
 }
 
 function configTemplateText() {
-  return JSON.stringify({ whitelist: DEFAULT_WHITELIST.slice() }, null, 2) + "\n";
+  return configToText(defaultConfig(), null);
 }
 
 function configDir(configPath) {
@@ -495,6 +563,27 @@ function writeConfigCommandArgs(configPath, config, raw) {
   var file = "config.json";
   var text = configToText(config, raw);
   return writeFileCommandArgs(configPath, text, "lensguard-write-config", file);
+}
+
+// argv for the atomic config RESET (LG-3): keep the current file (even a
+// broken one) as config.json.bak, then write fresh defaults the same atomic
+// way (mode 600 from the first byte). The broken content only ever lands in
+// the user's own .bak file on disk — never in a UI string or a log line.
+function configResetCommandArgs(configPath) {
+  var text = configTemplateText();
+  var p = String(configPath == null ? "" : configPath);
+  var idx = p.lastIndexOf("/");
+  var dir = idx > 0 ? p.substring(0, idx) : ".";
+  var base = idx > 0 ? p.substring(idx + 1) : "config.json";
+  var script = "f=$1; c=$2;"
+    + " if [ -e \"$f\" ] && [ ! -d \"$f\" ]; then cp -f -- \"$f\" \"$f.bak\" 2>/dev/null || true; fi;"
+    + " umask 077; mkdir -p -- \"$3\" || exit 1;"
+    + " tmp=\"$3/" + base + ".tmp.$$\";"
+    + " printf '%s' \"$c\" > \"$tmp\" || exit 1;"
+    + " mv -f -- \"$tmp\" \"$f\" || exit 1;"
+    + " echo ok";
+  return ["bash", "-c", script, "lensguard-reset-config",
+    String(configPath == null ? "" : configPath), text, dir];
 }
 
 // argv for the atomic state write (mode 600 from the first byte: umask 077,
@@ -880,18 +969,56 @@ function historyFromStateText(text) {
 // Notification decisions (popup + journal)
 // ---------------------------------------------------------------------------
 // The bar widget sends ONE Omarchy notification per process-opened event
-// where the process is NOT whitelisted. Whitelisted opens are calm (yellow
-// "known app") and never notify. Closed events never notify; the tooltip
-// carries the short return note instead.
+// when the config allows it:
+//   * notifyOnOpen (default true) is the master switch for camera-open
+//     notifications;
+//   * a whitelisted app is ALWAYS calm (yellow "known app") — the whitelist
+//     is the trusted list, so it never pops up regardless of the toggles;
+//   * an UNKNOWN (non-whitelisted) open pops up only when notifyOnUnknown is
+//     true (default). With notifyOnUnknown off the open still turns the bar
+//     red and shows an attention card, it just stays silent.
+// Closed events never notify; the tooltip carries the calm return note.
 
-function shouldNotifyOnOpen(processRow, whitelist) {
+function shouldNotifyOnOpen(processRow, whitelist, config) {
   if (!processRow) return false;
-  return !isWhitelisted(processRow.command, whitelist);
+  var cfg = config || defaultConfig();
+  if (cfg.notifyOnOpen !== true) return false;
+  if (isWhitelisted(processRow.command, whitelist)) return false;
+  return cfg.notifyOnUnknown !== false;
 }
 
 function notifySummary(processRow) {
   return "LensGuard: camera opened by " + (processRow.command || "?")
     + " (PID " + processRow.pid + ")";
+}
+
+// Short process label shown in the bar next to the icon while the camera is
+// in use (LG-3 showProcessInBar / compactMode). One process -> its command;
+// several -> the most relevant process (the unknown one wins, because that is
+// the one the user must see) plus a "+N" count of the rest. Empty string when
+// the camera is idle, so the bar stays icon-only.
+function barProcessText(view, whitelist) {
+  if (!view || !isActive(view)) return "";
+  var procs = groupByProcess(view.users);
+  if (procs.length === 0) return "";
+  var chosen = null;
+  for (var i = 0; i < procs.length; i++) {
+    if (!isWhitelisted(procs[i].command, whitelist)) { chosen = procs[i]; break; }
+  }
+  if (!chosen) chosen = procs[0];
+  var label = chosen.command || "?";
+  if (procs.length > 1) label += " +" + (procs.length - 1);
+  return label;
+}
+
+// Human label for a poll interval ("250 ms", "1 s", "1.5 s", "5 s").
+function intervalLabel(ms) {
+  var n = Number(ms);
+  if (!isFinite(n) || n < 0) return "";
+  if (n < 1000) return n + " ms";
+  var s = n / 1000;
+  if (s === Math.floor(s)) return s + " s";
+  return (Math.round(s * 10) / 10) + " s";
 }
 
 // argv for the cross-instance notification gate (flock). Omarchy runs one
@@ -937,6 +1064,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     DEFAULT_POLL_INTERVAL_MS: DEFAULT_POLL_INTERVAL_MS,
     MIN_POLL_INTERVAL_MS: MIN_POLL_INTERVAL_MS,
+    MAX_POLL_INTERVAL_MS: MAX_POLL_INTERVAL_MS,
     ERROR_RECHECK_MS: ERROR_RECHECK_MS,
     PROBE_WATCHDOG_MS: PROBE_WATCHDOG_MS,
     PROBE_ERROR_AFTER: PROBE_ERROR_AFTER,
@@ -947,6 +1075,7 @@ if (typeof module !== "undefined") {
     DEFAULT_WHITELIST: DEFAULT_WHITELIST,
     CONFIG_VERSION: CONFIG_VERSION,
     STATE_VERSION: STATE_VERSION,
+    CONFIG_BOOL_DEFAULTS: CONFIG_BOOL_DEFAULTS,
     probeScript: probeScript,
     probeCommand: probeCommand,
     isDeterministicErrorKind: isDeterministicErrorKind,
@@ -962,10 +1091,12 @@ if (typeof module !== "undefined") {
     commandMatches: commandMatches,
     isWhitelisted: isWhitelisted,
     defaultConfig: defaultConfig,
+    clampPollInterval: clampPollInterval,
     parseConfig: parseConfig,
     configToText: configToText,
     configTemplateText: configTemplateText,
     configDir: configDir,
+    configResetCommandArgs: configResetCommandArgs,
     writeConfigCommandArgs: writeConfigCommandArgs,
     writeStateCommandArgs: writeStateCommandArgs,
     writeFileCommandArgs: writeFileCommandArgs,
@@ -995,6 +1126,8 @@ if (typeof module !== "undefined") {
     writeStateCommandArgs: writeStateCommandArgs,
     shouldNotifyOnOpen: shouldNotifyOnOpen,
     notifySummary: notifySummary,
+    barProcessText: barProcessText,
+    intervalLabel: intervalLabel,
     notifGateCommandArgs: notifGateCommandArgs,
     pidIsNumeric: pidIsNumeric,
     investigateCommand: investigateCommand

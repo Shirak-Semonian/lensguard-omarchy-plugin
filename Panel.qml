@@ -18,8 +18,12 @@ import "Model.js" as Model
 //   * WHITELIST — the apps that may use the camera without an alert; entries
 //     can be removed here (Deny) and the config file can be opened for
 //     direct editing. All changes are written atomically, mode 600.
+//   * SETTINGS — poll interval, notification toggles, bar-text options and
+//     the reset-to-defaults action (config.json.bak is kept). Written the
+//     same atomic way, no JSON editing needed.
 // Config problems never stop the guard: the widget keeps working on the
-// defaults and the panel shows a calm note.
+// defaults and the panel shows a calm note (never the file content) with a
+// one-click reset.
 Panel {
   id: root
   moduleName: "io.github.shirak-semonian.lensguard"
@@ -30,9 +34,12 @@ Panel {
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
+  // Same calm state palette as the bar widget (LG-3): one hue per state so
+  // the panel and the bar can never disagree about what a state means.
   readonly property color success: "#a3be8c"
-  readonly property color warn: "#ebcb8b"
+  readonly property color warn: "#e6c384"
   readonly property color danger: "#bf616a"
+  readonly property color notice: "#d08770"
   readonly property color surface: Color.popups.background
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -44,6 +51,8 @@ Panel {
     ? hostWidget.view : Model.initialView()
   readonly property var whitelist: hostWidget && hostWidget.whitelist
     ? hostWidget.whitelist : Model.DEFAULT_WHITELIST
+  readonly property var config: hostWidget && hostWidget.config
+    ? hostWidget.config : Model.defaultConfig()
   readonly property string configPath: hostWidget && hostWidget.configPath
     ? hostWidget.configPath : ""
 
@@ -55,7 +64,7 @@ Panel {
 
   readonly property color statusColor: root.isActive
     ? (root.hasUnknown ? root.danger : root.warn)
-    : (root.hasError ? root.warn
+    : (root.hasError ? root.notice
       : (root.isLoading ? root.dim : root.success))
   readonly property string statusText: {
     if (root.isActive) {
@@ -113,6 +122,26 @@ Panel {
     if (hostWidget && typeof hostWidget.denyCommand === "function") {
       hostWidget.denyCommand(entry)
     }
+  }
+
+  // Generic settings change (LG-3): forwarded to the host widget, which
+  // applies it in memory and writes the full config atomically.
+  function setConfig(key, value) {
+    if (hostWidget && typeof hostWidget.setConfigValue === "function") {
+      hostWidget.setConfigValue(key, value)
+    }
+  }
+
+  // Reset the settings to defaults (keeps config.json.bak on disk).
+  function resetConfig() {
+    if (hostWidget && typeof hostWidget.resetConfigToDefaults === "function") {
+      hostWidget.resetConfigToDefaults()
+    }
+  }
+
+  // Human interval label for the settings dropdown + footer caption.
+  function intervalText(ms) {
+    return Model.intervalLabel(Model.clampPollInterval(ms))
   }
 
   function openConfig() {
@@ -183,7 +212,7 @@ Panel {
                 height: width
                 source: Qt.resolvedUrl(root.isActive
                   ? (root.hasUnknown ? "assets/icon-active.png" : "assets/icon-known.png")
-                  : "assets/icon.png")
+                  : (root.hasError ? "assets/icon-error.png" : "assets/icon.png"))
                 sourceSize.width: 128
                 sourceSize.height: 128
                 fillMode: Image.PreserveAspectFit
@@ -450,7 +479,7 @@ Panel {
             Text {
               width: parent.width
               text: "The config file is not readable or not valid JSON. "
-                + "LensGuard keeps working with the default whitelist."
+                + "LensGuard keeps working with the default settings."
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -469,14 +498,32 @@ Panel {
               horizontalAlignment: Text.AlignHCenter
             }
 
-            Button {
+            // One click heals a broken file: defaults are written atomically
+            // (mode 600) and the current file is kept as config.json.bak.
+            // Nothing from the broken file is ever shown in the UI.
+            Row {
               width: parent.width
-              text: "Open config file"
-              iconText: "\uf044"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              focusable: true
-              onClicked: root.openConfig()
+              spacing: Style.space(8)
+
+              Button {
+                width: (parent.width - Style.space(8)) / 2
+                text: "Open config file"
+                iconText: "\uf044"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                focusable: true
+                onClicked: root.openConfig()
+              }
+
+              Button {
+                width: (parent.width - Style.space(8)) / 2
+                text: "Reset to defaults"
+                iconText: "\uf0e2"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                focusable: true
+                onClicked: root.resetConfig()
+              }
             }
           }
 
@@ -562,9 +609,10 @@ Panel {
           Text {
             width: parent.width
             text: "Apps listed here may use the camera without an alert "
-              + "(calm yellow \"known app\" status). Everything else is red "
-              + "and notifies you. Add apps from an unknown-process card, "
-              + "remove them here, or edit the config file directly."
+              + "(calm yellow \"known app\" status). Everything else is "
+              + "unknown (red) and alerts you unless you turn alerts off in "
+              + "Settings. Add apps from an unknown-process card or remove "
+              + "them here."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -619,6 +667,98 @@ Panel {
             onClicked: root.openConfig()
           }
 
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          // ---- settings (LG-3) ---------------------------------------------
+          // All settings live in ~/.config/lensguard/config.json; changing a
+          // control writes the full config atomically (mode 600) — no JSON
+          // editing needed. Defaults are automatic for any missing key.
+          PanelSectionHeader {
+            text: "Settings"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Toggle {
+              width: parent.width
+              label: "Notify when the camera opens"
+              description: "Desktop notification when a new app opens the camera."
+              checked: root.config.notifyOnOpen !== false
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: false
+              onClicked: root.setConfig("notifyOnOpen", root.config.notifyOnOpen === false)
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Alert on unknown apps"
+              description: "When off, unknown opens stay red in the bar without a popup."
+              checked: root.config.notifyOnUnknown !== false
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: false
+              onClicked: root.setConfig("notifyOnUnknown", root.config.notifyOnUnknown === false)
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Show process name in the bar"
+              description: "While the camera is in use, name the process next to the icon."
+              checked: root.config.showProcessInBar !== false
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: false
+              onClicked: root.setConfig("showProcessInBar", root.config.showProcessInBar === false)
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Compact mode"
+              description: "Icon only — never show text in the bar."
+              checked: root.config.compactMode === true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              hasCursor: false
+              onClicked: root.setConfig("compactMode", root.config.compactMode !== true)
+            }
+
+            Dropdown {
+              id: intervalDropdown
+              width: parent.width
+              label: "Poll interval"
+              value: String(Model.clampPollInterval(root.config.pollIntervalMs))
+              options: [
+                { value: "250", label: "250 ms" },
+                { value: "500", label: "500 ms" },
+                { value: "1000", label: "1 second" },
+                { value: "2000", label: "2 seconds" },
+                { value: "5000", label: "5 seconds" }
+              ]
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onChanged: function(value) {
+                root.setConfig("pollIntervalMs", parseInt(value, 10))
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: "Stored in " + root.configPath + " (mode 600). "
+                + "Reset restores defaults and keeps config.json.bak."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
           // ---- actions ----------------------------------------------------
           Button {
             width: parent.width
@@ -632,7 +772,8 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Probes /dev/video* once per second. "
+            text: "Probes /dev/video* every "
+              + root.intervalText(root.config.pollIntervalMs) + ". "
               + "State and history are stored locally."
             color: root.dim
             font.family: root.fontFamily
