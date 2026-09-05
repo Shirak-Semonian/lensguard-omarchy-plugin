@@ -125,7 +125,18 @@ eq(v.lastEvent, null, "baseline emits no opened event")
 eq(M.isActive(v), true, "active helper")
 eq(M.statusLabel(v), "Camera in use", "status label active")
 
-// --- opened event --------------------------------------------------------
+// --- opened event (from idle) --------------------------------------------
+// Opening the camera while LensGuard watches idle must fire `opened` — the
+// live camera transition check caught this path regressing.
+let idleV = M.initialView()
+idleV = M.reduce(idleV, { type: "probeOk", users: [], at: 500, baseline: true })
+eq(idleV.status, "idle", "baseline without holders -> idle")
+idleV = M.reduce(idleV, { type: "probeOk", users: holderA, at: 1500 })
+eq(idleV.status, "active", "holder appears -> active")
+eq(idleV.lastEvent && idleV.lastEvent.kind, "opened", "idle -> active fires opened")
+eq(idleV.lastEvent.entry.pid, "4102", "opened event names the new process")
+
+// --- opened event (holder swap) ------------------------------------------
 v = M.reduce(v, { type: "probeOk", users: holderA, at: 2000 }) // same state
 eq(v.lastEvent, null, "no event when nothing changed")
 const holderB = [{ device: "/dev/video0", pid: "4242", user: "demo", command: "ffmpeg" }]

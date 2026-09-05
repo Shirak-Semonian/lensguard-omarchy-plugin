@@ -326,7 +326,9 @@ function reduce(view, action) {
     var users = sortUsers(action.users || []);
     var events = [];
     var lastEvent = null;
-    if (!action.baseline && st.users && st.users.length > 0) {
+    // Diff whenever this poll is not the startup baseline: opening the
+    // camera from idle (previous set empty) must still fire `opened`.
+    if (!action.baseline) {
       var diff = diffUsers(st.users, users);
       var k;
       for (k = 0; k < diff.closed.length; k++) {
