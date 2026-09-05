@@ -10,11 +10,12 @@
 //   - test-model.js requires it from Node (see the module.exports guard at
 //     the bottom).
 //
-// Polling (the process spawning, the 1 s cadence and the watchdog) lives in
+// Polling (the process spawning, the cadence and the watchdog) lives in
 // BarWidget.qml; this file only decides WHAT to run (probe script), how to
 // READ the probe output (lsof -F records or fuser -v table), how to diff one
-// poll against the previous one (opened/closed events) and what to display.
-// No shell, no Qt, no Node built-ins — the same code runs in both runtimes.
+// poll against the previous one (opened/closed events), what the whitelist /
+// notification rules are and what to display. No shell, no Qt, no Node
+// built-ins — the same code runs in both runtimes.
 
 // ---------------------------------------------------------------------------
 // Detection method (verified live during development)
@@ -44,6 +45,44 @@ var STATUS_LOADING = "loading";
 var STATUS_IDLE = "idle";
 var STATUS_ACTIVE = "active";
 var STATUS_ERROR = "error";
+
+// History is capped so the state file and the panel stay small and calm.
+var HISTORY_LIMIT = 20;
+
+// ---------------------------------------------------------------------------
+// Whitelist (camera apps that are allowed to use the lens without an alert)
+// ---------------------------------------------------------------------------
+// Known camera apps that are allowed to use the lens without an alert. The
+// list matches on the process COMMAND as reported by lsof/fuser (e.g. "zoom",
+// "obs", "chrome", "ffmpeg"); see commandMatches(). Browsers are listed
+// because PipeWire opens /dev/video* on their behalf — the process LensGuard
+// sees for a browser call is often "pipewire", so it is whitelisted too.
+// Users extend this via ~/.config/lensguard/config.json or the panel.
+var DEFAULT_WHITELIST = [
+  "zoom",
+  "obs",
+  "teams",
+  "chrome",
+  "chromium",
+  "firefox",
+  "brave",
+  "msedge",
+  "edge",
+  "slack",
+  "discord",
+  "whatsapp",
+  "skype",
+  "webex",
+  "pipewire",
+  "v4l2-ctl"
+];
+
+var CONFIG_VERSION = 1;
+var STATE_VERSION = 1;
+
+// ---------------------------------------------------------------------------
+// Display / classification helpers shared by QML and Node
+// ---------------------------------------------------------------------------
 
 // Deterministic probe failures (no tool / no device). They describe the
 // environment, not a transient glitch, so one observation is enough to enter
@@ -257,6 +296,230 @@ function parseProbeOutput(exitCode, raw) {
 }
 
 // ---------------------------------------------------------------------------
+// Process-level grouping
+// ---------------------------------------------------------------------------
+// The live holder list is kept per (device, pid) so the panel can show which
+// device each process holds. Events (opened/closed), history and alerts are
+// per PROCESS: one process opening video0+video1 at once is ONE camera-open
+// event, never two — the widget must not spam one notification per device.
+
+// Group device-level user rows into process-level rows.
+// Returns [{ pid, command, user, devices: [...] }] sorted by pid.
+function groupByProcess(users) {
+  var byPid = {};
+  var order = [];
+  var list = users || [];
+  for (var i = 0; i < list.length; i++) {
+    var u = list[i];
+    if (!u || u.pid == null) continue;
+    if (!byPid[u.pid]) {
+      byPid[u.pid] = { pid: u.pid, command: u.command || "", user: u.user || "", devices: [] };
+      order.push(u.pid);
+    }
+    var p = byPid[u.pid];
+    if (!p.command && u.command) p.command = u.command;
+    if (!p.user && u.user) p.user = u.user;
+    if (u.device && p.devices.indexOf(u.device) === -1) p.devices.push(u.device);
+  }
+  var out = [];
+  for (var oi = 0; oi < order.length; oi++) {
+    var proc = byPid[order[oi]];
+    proc.devices.sort();
+    out.push(proc);
+  }
+  out.sort(function (a, b) {
+    var pa = parseInt(a.pid, 10) || 0;
+    var pb = parseInt(b.pid, 10) || 0;
+    return pa - pb;
+  });
+  return out;
+}
+
+// Diff two holder sets at the PROCESS level. Returns
+//   { opened: [process rows newly holding the camera],
+//     closed: [process rows that stopped holding it] }
+function diffProcesses(prevUsers, nextUsers) {
+  var prevProcs = groupByProcess(prevUsers);
+  var nextProcs = groupByProcess(nextUsers);
+  var prevByPid = {};
+  var nextByPid = {};
+  for (var i = 0; i < prevProcs.length; i++) prevByPid[prevProcs[i].pid] = prevProcs[i];
+  for (var j = 0; j < nextProcs.length; j++) nextByPid[nextProcs[j].pid] = nextProcs[j];
+  var opened = [];
+  var closed = [];
+  var pid;
+  for (pid in nextByPid) {
+    if (!prevByPid[pid]) opened.push(nextByPid[pid]);
+  }
+  for (pid in prevByPid) {
+    if (!nextByPid[pid]) closed.push(prevByPid[pid]);
+  }
+  return { opened: opened, closed: closed };
+}
+
+// Keep at most HISTORY_LIMIT entries, newest first.
+function capHistory(history) {
+  if (!history || history.length === 0) return [];
+  return history.slice(0, HISTORY_LIMIT);
+}
+
+function entryForEvent(processRow) {
+  return {
+    pid: processRow.pid,
+    command: processRow.command || "?",
+    user: processRow.user || "",
+    devices: processRow.devices || [],
+    device: (processRow.devices && processRow.devices.length > 0)
+      ? processRow.devices[0] : ""
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Whitelist matching
+// ---------------------------------------------------------------------------
+// A whitelist entry matches the process COMMAND when the command starts with
+// the entry and the next character is a package separator ("-" or "_") or the
+// end of the string — so "zoom" matches "zoom", "teams" matches
+// "teams-for-linux", "obs" matches "obs-studio", but "zoom" never matches
+// "zoommalware" or "zoom.us" (a security tool errs on the side of alerting).
+// "chromium" is listed separately because "chrome" must not match it.
+function commandMatches(command, entry) {
+  if (!command || !entry) return false;
+  var c = String(command).toLowerCase().trim();
+  var p = String(entry).toLowerCase().trim();
+  if (!c || !p) return false;
+  if (c === p) return true;
+  if (c.indexOf(p) !== 0) return false;
+  var next = c.charAt(p.length);
+  return next === "-" || next === "_";
+}
+
+function isWhitelisted(command, whitelist) {
+  var list = whitelist || [];
+  for (var i = 0; i < list.length; i++) {
+    if (commandMatches(command, list[i])) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Config parsing (~/.config/lensguard/config.json)
+// ---------------------------------------------------------------------------
+// The config is optional. When it is missing, empty or broken the widget
+// quietly uses defaults — the camera guard must never stop working because
+// of a config typo. parseConfig returns
+//   { ok: true,  config: { whitelist: [...] }, source: "defaults"|"file" }
+//   { ok: false, kind: "parse"|"shape"|"field", message, hint }
+// and never leaks file content into user-facing strings.
+
+function defaultConfig() {
+  return { whitelist: DEFAULT_WHITELIST.slice() };
+}
+
+function parseConfig(raw) {
+  var text = String(raw == null ? "" : raw);
+  if (text.trim() === "") {
+    return { ok: true, config: defaultConfig(), source: "defaults" };
+  }
+  var obj = null;
+  try {
+    obj = JSON.parse(text);
+  } catch (error) {
+    return {
+      ok: false,
+      kind: "parse",
+      message: "config.json is not valid JSON",
+      hint: "edit or remove the file to use the defaults"
+    };
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return {
+      ok: false,
+      kind: "shape",
+      message: "config.json must contain a JSON object",
+      hint: "edit or remove the file to use the defaults"
+    };
+  }
+  var whitelist = DEFAULT_WHITELIST.slice();
+  var raw = obj;
+  if (obj.whitelist !== undefined) {
+    if (!Array.isArray(obj.whitelist)) {
+      return {
+        ok: false,
+        kind: "field",
+        message: "config: \"whitelist\" must be a list of app names",
+        hint: "edit or remove the file to use the defaults"
+      };
+    }
+    var clean = [];
+    for (var i = 0; i < obj.whitelist.length; i++) {
+      var item = obj.whitelist[i];
+      if (typeof item !== "string") continue;
+      var name = item.trim().toLowerCase();
+      if (!name) continue;
+      if (clean.indexOf(name) === -1) clean.push(name);
+    }
+    whitelist = clean;
+  }
+  return { ok: true, config: { whitelist: whitelist }, source: "file", raw: raw };
+}
+
+// Serialized config content. Only known keys are written; everything else the
+// user typed is preserved verbatim so editing via UI never destroys settings.
+function configToText(config, raw) {
+  var obj = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (var key in raw) {
+      if (Object.prototype.hasOwnProperty.call(raw, key)) obj[key] = raw[key];
+    }
+  }
+  obj.whitelist = (config && config.whitelist) || [];
+  return JSON.stringify(obj, null, 2) + "\n";
+}
+
+function configTemplateText() {
+  return JSON.stringify({ whitelist: DEFAULT_WHITELIST.slice() }, null, 2) + "\n";
+}
+
+function configDir(configPath) {
+  if (!configPath) return "";
+  var idx = configPath.lastIndexOf("/");
+  return idx > 0 ? configPath.substring(0, idx) : configPath;
+}
+
+// argv for the atomic config write (mode 600 from the first byte: umask 077,
+// unique temp file + mv — never write-then-chmod). Keeps the user's unknown
+// keys (raw object) and replaces whitelist.
+function writeConfigCommandArgs(configPath, config, raw) {
+  var dir = configDir(configPath);
+  var file = "config.json";
+  var text = configToText(config, raw);
+  return writeFileCommandArgs(configPath, text, "lensguard-write-config", file);
+}
+
+// argv for the atomic state write (mode 600 from the first byte: umask 077,
+// unique temp file + mv). The exact path is passed as argv so a future caller
+// can never write to the wrong basename.
+function writeStateCommandArgs(statePath, text) {
+  return writeFileCommandArgs(statePath, text, "lensguard-write-state", null);
+}
+
+// Generic atomic writer used for config.json and state.json. file is the
+// basename to target (defaults to the basename of path).
+function writeFileCommandArgs(path, text, name, file) {
+  var p = String(path == null ? "" : path);
+  var idx = p.lastIndexOf("/");
+  var dir = idx > 0 ? p.substring(0, idx) : ".";
+  var base = file || (idx > 0 ? p.substring(idx + 1) : p);
+  var script = "umask 077; mkdir -p -- \"$1\" || exit 1;"
+    + " tmp=\"$1/" + base + ".tmp.$$\";"
+    + " printf '%s' \"$2\" > \"$tmp\" || exit 1;"
+    + " mv -f -- \"$tmp\" \"$1/" + base + "\" || exit 1;"
+    + " echo ok";
+  return ["bash", "-c", script, name || "lensguard-write-file", dir, String(text == null ? "" : text)];
+}
+
+// ---------------------------------------------------------------------------
 // State reducer
 // ---------------------------------------------------------------------------
 // view = {
@@ -266,13 +529,15 @@ function parseProbeOutput(exitCode, raw) {
 //   message: "",                       // fixed sentence for error display
 //   at: 0,                             // last probe timestamp (ms)
 //   consecutiveFailures: 0,            // transient failures in a row
-//   lastEvent: null | { kind: "opened"|"closed", at, entry }
+//   lastEvent: null | { kind: "opened"|"closed", at, entry: {pid, command, user, device, devices} },
+//   history: [ event, ... ],           // newest first, capped at HISTORY_LIMIT
+//   openedAt: { pid: ms }              // when each current process opened (live "since")
 // }
 //
-// Events: opened/closed fire when the holder set differs from the previous
-// poll. The FIRST successful poll after the widget starts is a silent
-// baseline (action.baseline = true) so a widget that starts while the camera
-// is already in use does not ring a false "opened".
+// Events: opened/closed fire when the PROCESS holder set differs from the
+// previous poll. The FIRST successful poll after the widget starts is a
+// silent baseline (action.baseline = true) so a widget that starts while the
+// camera is already in use does not ring a false "opened".
 
 function initialView() {
   return {
@@ -282,7 +547,9 @@ function initialView() {
     message: "",
     at: 0,
     consecutiveFailures: 0,
-    lastEvent: null
+    lastEvent: null,
+    history: [],
+    openedAt: {}
   };
 }
 
@@ -290,10 +557,8 @@ function entryKey(entry) {
   return entry.device + "|" + entry.pid;
 }
 
-// Diff two holder sets (each a list of {device,pid,user,command}). Keyed by
-// device+pid: a process that opens a second device while already listed
-// counts as opened for that device; a process that closes one of two devices
-// counts as closed for that device.
+// Device-level diff, still exported for tests and the live holder set; the
+// reducer uses diffProcesses() for events/history/alerts.
 function diffUsers(prev, next) {
   var prevKeys = {};
   var nextKeys = {};
@@ -311,6 +576,83 @@ function diffUsers(prev, next) {
   return { opened: opened, closed: closed };
 }
 
+function addHistoryEvent(history, kind, at, processRow) {
+  var entry = entryForEvent(processRow);
+  var event = {
+    kind: kind,
+    at: at,
+    pid: entry.pid,
+    command: entry.command,
+    user: entry.user,
+    device: entry.device
+  };
+  var next = [event];
+  if (history && history.length) next = next.concat(history);
+  return capHistory(next);
+}
+
+// applyProbe handles one successful probe. Returns
+//   { view, events: [{kind, at, process}] }  — events = transitions (opened/
+// closed), EMPTY on a baseline poll so the caller never notifies on baseline.
+function applyProbe(prevView, action) {
+  var st = prevView || initialView();
+  var at = action.at || 0;
+  var users = sortUsers(action.users || []);
+  var events = [];
+  var openedAt = {};
+  // Carry over known open timestamps for processes still holding the camera.
+  var prevProcs = groupByProcess(st.users);
+  for (var pi = 0; pi < prevProcs.length; pi++) {
+    var prevPid = String(prevProcs[pi].pid);
+    if (st.openedAt && st.openedAt[prevPid]) openedAt[prevPid] = st.openedAt[prevPid];
+  }
+  var history = st.history || [];
+  var lastEvent = st.lastEvent;
+
+  if (!action.baseline) {
+    var diff = diffProcesses(st.users, users);
+    var k;
+    for (k = 0; k < diff.closed.length; k++) {
+      var closedProc = diff.closed[k];
+      delete openedAt[String(closedProc.pid)];
+      history = addHistoryEvent(history, "closed", at, closedProc);
+      events.push({ kind: "closed", at: at, process: closedProc });
+      lastEvent = { kind: "closed", at: at, entry: entryForEvent(closedProc) };
+    }
+    for (k = 0; k < diff.opened.length; k++) {
+      var openedProc = diff.opened[k];
+      openedAt[String(openedProc.pid)] = at;
+      history = addHistoryEvent(history, "opened", at, openedProc);
+      events.push({ kind: "opened", at: at, process: openedProc });
+      // An open wins over a close within the same poll (more interesting).
+      lastEvent = { kind: "opened", at: at, entry: entryForEvent(openedProc) };
+    }
+  } else {
+    // Silent baseline: the current holders become the reference, but the
+    // widget records their open time so the panel can show "since" without
+    // ringing a false opened event.
+    var procs = groupByProcess(users);
+    for (var bi = 0; bi < procs.length; bi++) {
+      openedAt[String(procs[bi].pid)] = at;
+    }
+  }
+
+  return {
+    view: {
+      status: users.length > 0 ? STATUS_ACTIVE : STATUS_IDLE,
+      users: users,
+      errorKind: "",
+      message: "",
+      at: at,
+      consecutiveFailures: 0,
+      lastEvent: lastEvent,
+      history: history,
+      openedAt: openedAt
+    },
+    events: events
+  };
+}
+
 function reduce(view, action) {
   var st = view || initialView();
   if (!action) return st;
@@ -323,39 +665,7 @@ function reduce(view, action) {
   }
 
   if (action.type === "probeOk") {
-    var users = sortUsers(action.users || []);
-    var events = [];
-    var lastEvent = null;
-    // Diff whenever this poll is not the startup baseline: opening the
-    // camera from idle (previous set empty) must still fire `opened`.
-    if (!action.baseline) {
-      var diff = diffUsers(st.users, users);
-      var k;
-      for (k = 0; k < diff.closed.length; k++) {
-        events.push({ kind: "closed", at: at, entry: diff.closed[k] });
-      }
-      for (k = 0; k < diff.opened.length; k++) {
-        events.push({ kind: "opened", at: at, entry: diff.opened[k] });
-      }
-      // One last-event for the panel/activity line; an open wins over a
-      // close within the same poll (the more interesting transition).
-      if (diff.opened.length > 0) {
-        lastEvent = { kind: "opened", at: at, entry: diff.opened[diff.opened.length - 1] };
-      } else if (diff.closed.length > 0) {
-        lastEvent = { kind: "closed", at: at, entry: diff.closed[diff.closed.length - 1] };
-      } else {
-        lastEvent = st.lastEvent;
-      }
-    }
-    return {
-      status: users.length > 0 ? STATUS_ACTIVE : STATUS_IDLE,
-      users: users,
-      errorKind: "",
-      message: "",
-      at: at,
-      consecutiveFailures: 0,
-      lastEvent: lastEvent
-    };
+    return applyProbe(st, action).view;
   }
 
   if (action.type === "probeError") {
@@ -371,7 +681,9 @@ function reduce(view, action) {
         message: message,
         at: at,
         consecutiveFailures: consec,
-        lastEvent: st.lastEvent
+        lastEvent: st.lastEvent,
+        history: st.history || [],
+        openedAt: st.openedAt || {}
       };
     }
     // One transient failure: stay calm on the last known state, but remember
@@ -379,6 +691,17 @@ function reduce(view, action) {
     var quiet = Object.assign({}, st);
     quiet.consecutiveFailures = consec;
     return quiet;
+  }
+
+  if (action.type === "restoreHistory") {
+    // Called once at startup with events read from the state file. Restoring
+    // is display-only: it never fires notifications and never re-alerts.
+    var restored = action.history || [];
+    if (restored.length === 0) return st;
+    var merged = capHistory(restored.concat(st.history || []));
+    var out = Object.assign({}, st);
+    out.history = merged;
+    return out;
   }
 
   return st;
@@ -405,23 +728,72 @@ function errorText(view) {
   return "";
 }
 
+// Process rows for the current holders with their open time ("since").
+function processRows(view, whitelist) {
+  if (!view || !isActive(view)) return [];
+  var procs = groupByProcess(view.users);
+  for (var i = 0; i < procs.length; i++) {
+    var p = procs[i];
+    p.known = isWhitelisted(p.command, whitelist);
+    p.since = view.openedAt ? view.openedAt[String(p.pid)] || 0 : 0;
+  }
+  return procs;
+}
+
+function anyUnknown(view, whitelist) {
+  var rows = processRows(view, whitelist);
+  for (var i = 0; i < rows.length; i++) {
+    if (!rows[i].known) return true;
+  }
+  return false;
+}
+
+function allKnown(view, whitelist) {
+  var rows = processRows(view, whitelist);
+  if (rows.length === 0) return false;
+  for (var i = 0; i < rows.length; i++) {
+    if (!rows[i].known) return false;
+  }
+  return true;
+}
+
 // One tooltip line per process holding the camera: "• v4l2-ctl (PID 77000)".
 function activeProcessLines(view) {
   var lines = [];
-  var seen = {};
-  var users = view && view.users ? view.users : [];
-  for (var i = 0; i < users.length; i++) {
-    var pid = users[i].pid;
-    if (seen[pid]) continue;
-    seen[pid] = true;
-    lines.push("\u2022 " + users[i].command + " (PID " + pid + ")");
+  var procs = view && view.users ? groupByProcess(view.users) : [];
+  for (var i = 0; i < procs.length; i++) {
+    lines.push("\u2022 " + procs[i].command + " (PID " + procs[i].pid + ")");
   }
   return lines;
 }
 
-function tooltipText(view) {
+// Human time "HH:MM:SS" from a ms epoch (used by panel history/live rows).
+function formatTime(ms) {
+  if (!ms || ms <= 0) return "";
+  var d = new Date(ms);
+  function two(n) { return (n < 10 ? "0" : "") + n; }
+  return two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds());
+}
+
+// Short human "since" for a process row: absolute time when it started today.
+function sinceText(ms) {
+  return formatTime(ms);
+}
+
+function tooltipText(view, now) {
   if (!view || isLoading(view)) return "LensGuard \u2014 checking the camera\u2026";
-  if (isIdle(view)) return "LensGuard \u2014 camera idle";
+  if (isIdle(view)) {
+    // A recent close gets a short, calm return note in the tooltip (LG-2).
+    var base = "LensGuard \u2014 camera idle";
+    var le = view.lastEvent;
+    if (le && le.kind === "closed" && le.entry && le.entry.command) {
+      var ts = now || 0;
+      if (!ts || (ts - (le.at || 0)) < 15000) {
+        return base + "\n" + le.entry.command + " released the camera";
+      }
+    }
+    return base;
+  }
   if (isActive(view)) {
     var lines = activeProcessLines(view);
     var body = "Camera in use by:";
@@ -444,6 +816,123 @@ function lastEventText(view) {
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// State file (~/.local/state/lensguard/state.json)
+// ---------------------------------------------------------------------------
+// Persists the short event history + the last known status so the panel shows
+// context after a shell restart. Restoring is display-only (see
+// reduce restoreHistory): the widget still takes a silent baseline on the
+// first poll, so a restart while the camera is open never re-alarms (MyIP
+// lesson).
+
+function stateToText(view) {
+  var history = (view && view.history) || [];
+  var last = (view && view.lastEvent) || null;
+  return JSON.stringify({
+    version: STATE_VERSION,
+    savedAt: Date.now ? Date.now() : 0,
+    status: view ? view.status : "",
+    history: history.map(function (e) {
+      return {
+        kind: e.kind,
+        at: e.at,
+        pid: e.pid,
+        command: e.command,
+        user: e.user,
+        device: e.device
+      };
+    }),
+    lastEvent: last ? {
+      kind: last.kind,
+      at: last.at,
+      pid: last.entry ? last.entry.pid : "",
+      command: last.entry ? last.entry.command : ""
+    } : null
+  }, null, 2) + "\n";
+}
+
+function historyFromStateText(text) {
+  try {
+    var obj = JSON.parse(String(text == null ? "" : text));
+    if (!obj || typeof obj !== "object" || !Array.isArray(obj.history)) return [];
+    var out = [];
+    var hist = obj.history;
+    for (var i = 0; i < hist.length && out.length < HISTORY_LIMIT; i++) {
+      var e = hist[i];
+      if (!e || typeof e !== "object") continue;
+      if (e.kind !== "opened" && e.kind !== "closed") continue;
+      out.push({
+        kind: e.kind,
+        at: Number(e.at) || 0,
+        pid: String(e.pid == null ? "" : e.pid),
+        command: String(e.command == null ? "?" : e.command),
+        user: String(e.user == null ? "" : e.user),
+        device: String(e.device == null ? "" : e.device)
+      });
+    }
+    return out;
+  } catch (error) {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Notification decisions (popup + journal)
+// ---------------------------------------------------------------------------
+// The bar widget sends ONE Omarchy notification per process-opened event
+// where the process is NOT whitelisted. Whitelisted opens are calm (yellow
+// "known app") and never notify. Closed events never notify; the tooltip
+// carries the short return note instead.
+
+function shouldNotifyOnOpen(processRow, whitelist) {
+  if (!processRow) return false;
+  return !isWhitelisted(processRow.command, whitelist);
+}
+
+function notifySummary(processRow) {
+  return "LensGuard: camera opened by " + (processRow.command || "?")
+    + " (PID " + processRow.pid + ")";
+}
+
+// argv for the cross-instance notification gate (flock). Omarchy runs one
+// widget instance per monitor; two instances can observe the SAME transition
+// and both want to notify. Each instance atomically records "{key} {instance}
+// {unixSeconds}" in a gate file (flock'd). An instance skips only when the
+// same key was recorded by a DIFFERENT instance within the ttl window — its
+// own earlier record never suppresses a genuinely later transition (a
+// reopened process with the same pid+command still notifies).
+function notifGateCommandArgs(stateFile, key, instanceId, ttlSeconds) {
+  var ttl = Number(ttlSeconds);
+  if (!isFinite(ttl) || ttl < 1) ttl = 25;
+  var script = "f=$1; key=$2; me=$3; ttl=$4;"
+    + " dir=$(dirname -- \"$f\"); mkdir -p -- \"$dir\" 2>/dev/null || { echo skip; exit 0; };"
+    + " lock=\"$f.lock\"; exec 9>\"$lock\" || { echo skip; exit 0; };"
+    + " flock 9 2>/dev/null || { echo skip; exit 0; };"
+    + " now=$(date +%s); prev=\"\"; prevme=\"\"; prevts=0;"
+    + " if [ -f \"$f\" ]; then read -r prev prevme prevts < \"$f\" 2>/dev/null || true; fi;"
+    + " if [ \"$prev\" = \"$key\" ] && [ -n \"$prevme\" ] && [ \"$prevme\" != \"$me\" ]"
+    + "   && [ -n \"$prevts\" ] && [ \"$(( now - prevts ))\" -lt \"$ttl\" ]; then echo skip;"
+    + " else printf '%s %s %s\\n' \"$key\" \"$me\" \"$now\" > \"$f\"; echo send; fi";
+  return ["bash", "-c", script, "lensguard-notif-gate",
+    String(stateFile == null ? "" : stateFile), String(key == null ? "" : key),
+    String(instanceId == null ? "" : instanceId), String(ttl)];
+}
+
+// A process is only ever identified by its numeric pid (lsof/fuser output).
+// Investigate reads /proc/<pid>/cmdline through a fixed argv so the panel can
+// show the FULL command line of an unknown process (lsof's comm is trimmed).
+// argv only, pid validated numeric — no shell interpolation.
+function pidIsNumeric(pid) {
+  return /^\d+$/.test(String(pid == null ? "" : pid));
+}
+
+function investigateCommand(pid) {
+  if (!pidIsNumeric(pid)) return null;
+  return ["bash", "-c",
+    "tr '\\0' ' ' < /proc/$1/cmdline; echo;",
+    "lensguard-investigate", String(pid)];
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     DEFAULT_POLL_INTERVAL_MS: DEFAULT_POLL_INTERVAL_MS,
@@ -454,6 +943,10 @@ if (typeof module !== "undefined") {
     MAX_OUTPUT_CHARS: MAX_OUTPUT_CHARS,
     ERR_NO_TOOL: ERR_NO_TOOL,
     ERR_NO_DEVICE: ERR_NO_DEVICE,
+    HISTORY_LIMIT: HISTORY_LIMIT,
+    DEFAULT_WHITELIST: DEFAULT_WHITELIST,
+    CONFIG_VERSION: CONFIG_VERSION,
+    STATE_VERSION: STATE_VERSION,
     probeScript: probeScript,
     probeCommand: probeCommand,
     isDeterministicErrorKind: isDeterministicErrorKind,
@@ -462,9 +955,25 @@ if (typeof module !== "undefined") {
     parseLsofOutput: parseLsofOutput,
     parseFuserOutput: parseFuserOutput,
     parseProbeOutput: parseProbeOutput,
+    groupByProcess: groupByProcess,
+    diffProcesses: diffProcesses,
+    capHistory: capHistory,
+    entryForEvent: entryForEvent,
+    commandMatches: commandMatches,
+    isWhitelisted: isWhitelisted,
+    defaultConfig: defaultConfig,
+    parseConfig: parseConfig,
+    configToText: configToText,
+    configTemplateText: configTemplateText,
+    configDir: configDir,
+    writeConfigCommandArgs: writeConfigCommandArgs,
+    writeStateCommandArgs: writeStateCommandArgs,
+    writeFileCommandArgs: writeFileCommandArgs,
     initialView: initialView,
     entryKey: entryKey,
     diffUsers: diffUsers,
+    addHistoryEvent: addHistoryEvent,
+    applyProbe: applyProbe,
     reduce: reduce,
     sortUsers: sortUsers,
     isLoading: isLoading,
@@ -473,8 +982,21 @@ if (typeof module !== "undefined") {
     isError: isError,
     statusLabel: statusLabel,
     errorText: errorText,
+    processRows: processRows,
+    anyUnknown: anyUnknown,
+    allKnown: allKnown,
     activeProcessLines: activeProcessLines,
+    formatTime: formatTime,
+    sinceText: sinceText,
     tooltipText: tooltipText,
-    lastEventText: lastEventText
+    lastEventText: lastEventText,
+    stateToText: stateToText,
+    historyFromStateText: historyFromStateText,
+    writeStateCommandArgs: writeStateCommandArgs,
+    shouldNotifyOnOpen: shouldNotifyOnOpen,
+    notifySummary: notifySummary,
+    notifGateCommandArgs: notifGateCommandArgs,
+    pidIsNumeric: pidIsNumeric,
+    investigateCommand: investigateCommand
   };
 }

@@ -47,6 +47,10 @@ eq(M.PROBE_ERROR_AFTER, 2, "error after two consecutive transient failures")
 eq(M.ERROR_RECHECK_MS, 5000, "calm 5 s re-check in the error state")
 eq(M.ERR_NO_TOOL, "__LG_ERR_NO_TOOL__", "no-tool marker")
 eq(M.ERR_NO_DEVICE, "__LG_ERR_NO_DEVICE__", "no-device marker")
+eq(M.HISTORY_LIMIT, 20, "history is capped at 20 entries")
+ok(Array.isArray(M.DEFAULT_WHITELIST), "default whitelist is an array")
+has(M.DEFAULT_WHITELIST.join(","), "zoom", "default whitelist contains zoom")
+has(M.DEFAULT_WHITELIST.join(","), "obs", "default whitelist contains obs")
 
 // --- probe command -------------------------------------------------------
 const cmd = M.probeCommand()
@@ -110,20 +114,88 @@ eq(r.kind, "parse", "unexpected output kind")
 eq(M.parseProbeOutput(0, "x".repeat(M.MAX_OUTPUT_CHARS + 50)).ok, false,
   "oversized output is capped before parsing (no memory blow-up)")
 
+// --- process grouping ----------------------------------------------------
+const procs = M.groupByProcess(users)
+eq(procs.length, 2, "groupByProcess: 4 device rows collapse to 2 processes")
+eq(procs[1].pid, "77002", "process rows sorted by pid")
+eq(procs[1].devices.length, 2, "v4l2-ctl holds video0+video1")
+const dproc = M.diffProcesses([], users)
+eq(dproc.opened.length, 2, "diffProcesses from empty -> both processes opened")
+eq(dproc.closed.length, 0, "diffProcesses: nothing closed")
+const dproc2 = M.diffProcesses(users, [])
+eq(dproc2.opened.length, 0, "diffProcesses: nothing opened")
+eq(dproc2.closed.length, 2, "diffProcesses -> both processes closed")
+
+// --- whitelist matching --------------------------------------------------
+eq(M.commandMatches("zoom", "zoom"), true, "exact command matches")
+eq(M.commandMatches("zoom.us", "zoom"), false, "zoom does not match zoom.us (boundary)")
+eq(M.commandMatches("teams-for-linux", "teams"), true, "prefix at '-' boundary matches")
+eq(M.commandMatches("chrome", "chromium"), false, "chrome != chromium")
+eq(M.commandMatches("chromium", "chromium"), true, "chromium exact")
+eq(M.commandMatches("obs", "obs"), true, "obs exact")
+eq(M.commandMatches("obs-studio", "obs"), true, "obs matches obs-studio")
+eq(M.commandMatches("zoommalware", "zoom"), false, "no prefix-match past alnum (security)")
+eq(M.commandMatches("ZOOM", "zoom"), true, "case-insensitive")
+eq(M.isWhitelisted("ffmpeg", M.DEFAULT_WHITELIST), false, "ffmpeg not whitelisted by default")
+eq(M.isWhitelisted("zoom", M.DEFAULT_WHITELIST), true, "zoom whitelisted by default")
+eq(M.isWhitelisted("v4l2-ctl", M.DEFAULT_WHITELIST), true, "v4l2-ctl listed as known test tool")
+eq(M.isWhitelisted("firefox", M.DEFAULT_WHITELIST), true, "firefox whitelisted")
+eq(M.isWhitelisted("unknown-cam", []), false, "empty whitelist -> everything unknown")
+
+// --- config parsing ------------------------------------------------------
+let cfg = M.parseConfig("")
+eq(cfg.ok, true, "empty config is fine (defaults)")
+eq(cfg.source, "defaults", "empty config -> defaults")
+eq(cfg.config.whitelist.length, M.DEFAULT_WHITELIST.length, "defaults whitelist")
+cfg = M.parseConfig("   \n ")
+eq(cfg.ok, true, "whitespace config is fine (defaults)")
+cfg = M.parseConfig("{ not json")
+eq(cfg.ok, false, "broken json -> parse error")
+eq(cfg.kind, "parse", "parse error kind")
+cfg = M.parseConfig("[1,2]")
+eq(cfg.ok, false, "array is not a config object")
+eq(cfg.kind, "shape", "shape error kind")
+cfg = M.parseConfig('{"whitelist": "zoom"}')
+eq(cfg.ok, false, "whitelist must be an array")
+eq(cfg.kind, "field", "field error kind")
+cfg = M.parseConfig('{"whitelist": ["zoom", "OBS", "", 42, "teams", "teams"]}')
+eq(cfg.ok, true, "mixed whitelist is tolerated")
+eq(cfg.config.whitelist.length, 3, "non-strings/duplicates/empty removed")
+eq(cfg.config.whitelist[0], "zoom", "first entry preserved")
+eq(cfg.config.whitelist[1], "obs", "lowercased")
+cfg = M.parseConfig('{"pollIntervalSeconds": 60, "whitelist": ["zoom"]}')
+eq(cfg.ok, true, "unknown keys are preserved, not an error")
+eq(cfg.config.whitelist.length, 1, "whitelist parsed from object with extra keys")
+const ctext = M.configToText({ whitelist: ["zoom"] }, { pollIntervalSeconds: 60 })
+has(ctext, "pollIntervalSeconds", "configToText preserves unknown keys")
+has(ctext, '"zoom"', "configToText writes whitelist")
+const template = M.configTemplateText()
+has(template, "zoom", "template has defaults")
+eq(M.configDir("/home/u/.config/lensguard/config.json"), "/home/u/.config/lensguard", "configDir")
+const wc = M.writeConfigCommandArgs("/x/lensguard/config.json", { whitelist: [] }, null)
+eq(wc[0], "bash", "config write via bash")
+has(wc[2], "umask 077", "config written mode 600 from the first byte")
+has(wc[2], "config.json.tmp.$$", "config write uses a temp file")
+has(wc[2], "mv -f", "config write is atomic")
+has(wc[2], "printf '%s' \"$2\"", "content travels as argv, never shell text")
+
 // --- state reducer: baseline is silent ----------------------------------
 let v = M.initialView()
 eq(v.status, "loading", "starts loading")
 eq(M.isLoading(v), true, "loading helper")
 v = M.reduce(v, { type: "probeStart", at: 1 })
 eq(v.status, "loading", "probeStart keeps loading (no flicker)")
+eq(v.history.length, 0, "no history yet")
 // First successful poll while the camera is ALREADY in use: active, but the
 // baseline must not ring a false "opened" event.
 const holderA = [{ device: "/dev/video0", pid: "4102", user: "demo", command: "example-cam" }]
 v = M.reduce(v, { type: "probeOk", users: holderA, at: 1000, baseline: true })
 eq(v.status, "active", "baseline with a holder -> active")
 eq(v.lastEvent, null, "baseline emits no opened event")
+eq(v.history.length, 0, "baseline adds no history")
 eq(M.isActive(v), true, "active helper")
 eq(M.statusLabel(v), "Camera in use", "status label active")
+eq(v.openedAt["4102"], 1000, "baseline records the open time for live 'since'")
 
 // --- opened event (from idle) --------------------------------------------
 // Opening the camera while LensGuard watches idle must fire `opened` — the
@@ -135,8 +207,28 @@ idleV = M.reduce(idleV, { type: "probeOk", users: holderA, at: 1500 })
 eq(idleV.status, "active", "holder appears -> active")
 eq(idleV.lastEvent && idleV.lastEvent.kind, "opened", "idle -> active fires opened")
 eq(idleV.lastEvent.entry.pid, "4102", "opened event names the new process")
+eq(idleV.history.length, 1, "history has one event")
+eq(idleV.history[0].kind, "opened", "history entry is opened")
+eq(idleV.history[0].pid, "4102", "history entry carries the pid")
+eq(idleV.openedAt["4102"], 1500, "openedAt set when the process opens")
 
-// --- opened event (holder swap) ------------------------------------------
+// --- multi-device open is ONE process event ------------------------------
+// One process opening video0+video1 at once must fire exactly one opened
+// event and one history row (no notification spam per device).
+let multiV = M.initialView()
+multiV = M.reduce(multiV, { type: "probeOk", users: [], at: 100, baseline: true })
+multiV = M.reduce(multiV, {
+  type: "probeOk", users: [
+    { device: "/dev/video0", pid: "7", user: "demo", command: "zoomish" },
+    { device: "/dev/video1", pid: "7", user: "demo", command: "zoomish" }
+  ], at: 200 })
+eq(multiV.lastEvent.kind, "opened", "multi-device open fires opened once")
+eq(multiV.history.length, 1, "multi-device open -> one history entry")
+eq(multiV.history[0].command, "zoomish", "history process name")
+eq(multiV.users.length, 2, "live holder rows still list both devices")
+eq(M.activeProcessLines(multiV).length, 1, "tooltip lists the process once")
+
+// --- closed event (whole process released) -------------------------------
 v = M.reduce(v, { type: "probeOk", users: holderA, at: 2000 }) // same state
 eq(v.lastEvent, null, "no event when nothing changed")
 const holderB = [{ device: "/dev/video0", pid: "4242", user: "demo", command: "ffmpeg" }]
@@ -146,30 +238,44 @@ eq(v.lastEvent.kind, "opened", "opened event fired")
 eq(v.lastEvent.entry.pid, "4242", "opened event names the process")
 eq(v.lastEvent.entry.command, "ffmpeg", "opened event command")
 eq(v.consecutiveFailures, 0, "success resets the failure counter")
+eq(v.openedAt["4242"], 3000, "new process since time recorded")
+eq(v.openedAt["4102"], undefined, "old process since removed")
 
-// --- closed event --------------------------------------------------------
+// Releasing one of two devices while the process still holds another is NOT
+// a close (the camera is still in use) — no spam, no history entry.
+v = M.reduce(v, {
+  type: "probeOk", users: [
+    { device: "/dev/video0", pid: "4242", user: "demo", command: "ffmpeg" },
+    { device: "/dev/video1", pid: "4242", user: "demo", command: "ffmpeg" }
+  ], at: 3100 })
+const histBefore = v.history.length
+v = M.reduce(v, {
+  type: "probeOk", users: [
+    { device: "/dev/video0", pid: "4242", user: "demo", command: "ffmpeg" }
+  ], at: 3200 })
+eq(v.status, "active", "still active while one device remains")
+eq(v.history.length, histBefore, "closing one of two devices adds no history")
+eq(v.lastEvent.kind, "opened", "last event stays the open (no false close)")
+
+// Real close (all devices released) fires exactly one closed event.
 v = M.reduce(v, { type: "probeOk", users: [], at: 4000 })
 eq(v.status, "idle", "no holders -> idle")
 eq(v.lastEvent.kind, "closed", "closed event fired when the camera is released")
 eq(v.lastEvent.entry.pid, "4242", "closed event names the released process")
+eq(v.history[0].kind, "closed", "history newest-first has the closed event")
 eq(M.isIdle(v), true, "idle helper")
 eq(M.statusLabel(v), "Camera idle", "status label idle")
 
-// --- multi-device diff ---------------------------------------------------
-// Process 7 opens video0 + video1 at once -> two opened events (per device),
-// but the process appears once in the tooltip lines.
-let multi = M.reduce(M.initialView(), {
-  type: "probeOk", users: [
-    { device: "/dev/video0", pid: "7", user: "demo", command: "zoomish" },
-    { device: "/dev/video1", pid: "7", user: "demo", command: "zoomish" }
-  ], at: 100, baseline: true })
-multi = M.reduce(multi, {
-  type: "probeOk", users: [
-    { device: "/dev/video0", pid: "7", user: "demo", command: "zoomish" }
-  ], at: 200 })
-eq(multi.lastEvent.kind, "closed", "closing one of two devices fires closed")
-eq(multi.users.length, 1, "one device left")
-eq(M.activeProcessLines(multi).length, 1, "tooltip lists the process once")
+// --- history cap ---------------------------------------------------------
+let capV = M.initialView()
+capV = M.reduce(capV, { type: "probeOk", users: [], at: 1, baseline: true })
+for (let i = 0; i < 30; i++) {
+  capV = M.reduce(capV, {
+    type: "probeOk", users: [{ device: "/dev/video0", pid: String(100 + i), user: "demo", command: "p" + i }], at: 2 + i })
+  capV = M.reduce(capV, { type: "probeOk", users: [], at: 1000 + i })
+}
+eq(capV.history.length, M.HISTORY_LIMIT, "history stays capped at HISTORY_LIMIT")
+eq(capV.history[0].pid, "129", "newest event first (last iteration 100+29)")
 
 // --- transient failure handling ------------------------------------------
 v = M.initialView()
@@ -200,26 +306,103 @@ eq(v.status, "active", "success recovers from error")
 eq(v.consecutiveFailures, 0, "recovery resets the counter")
 eq(v.errorKind, "", "error kind cleared")
 
+// --- restoreHistory is display-only --------------------------------------
+let restored = M.initialView()
+restored = M.reduce(restored, { type: "restoreHistory", history: [
+  { kind: "opened", at: 1000, pid: "55", command: "oldcam", user: "", device: "/dev/video0" },
+  { kind: "closed", at: 2000, pid: "55", command: "oldcam", user: "", device: "/dev/video0" }
+] })
+eq(restored.history.length, 2, "restored history is kept for the panel")
+eq(restored.lastEvent, null, "restoring history never fabricates a lastEvent")
+eq(restored.status, "loading", "restoring history never changes live status")
+restored = M.reduce(restored, { type: "probeOk", users: holderA, at: 5000, baseline: true })
+eq(restored.history.length, 2, "baseline after restore adds no new history")
+eq(restored.lastEvent, null, "baseline after restore is still silent")
+restored = M.reduce(restored, { type: "probeOk", users: [], at: 6000 })
+eq(restored.lastEvent.kind, "closed", "live close after restore fires normally")
+eq(restored.history[0].kind, "closed", "live event is newest-first on top")
+
+// --- process rows / known classification ---------------------------------
+const cfgKnown = { whitelist: ["zoom", "obs"] }
+const actV = { status: "active", users: [
+  { device: "/dev/video0", pid: "10", user: "demo", command: "zoom" },
+  { device: "/dev/video0", pid: "11", user: "demo", command: "ffmpeg" }
+], errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null,
+  history: [], openedAt: { "10": 100, "11": 200 } }
+const rows = M.processRows(actV, cfgKnown.whitelist)
+eq(rows.length, 2, "processRows returns one row per process")
+eq(rows[0].known, true, "zoom row known")
+eq(rows[1].known, false, "ffmpeg row unknown")
+eq(M.anyUnknown(actV, cfgKnown.whitelist), true, "anyUnknown true when a holder is unknown")
+eq(M.allKnown(actV, cfgKnown.whitelist), false, "allKnown false with an unknown holder")
+const onlyKnownV = { status: "active", users: [{ device: "/dev/video0", pid: "10", user: "demo", command: "zoom" }],
+  openedAt: { "10": 100 }, history: [], lastEvent: null }
+eq(M.anyUnknown(onlyKnownV, cfgKnown.whitelist), false, "no unknown with only zoom")
+eq(M.allKnown(onlyKnownV, cfgKnown.whitelist), true, "allKnown true with only zoom")
+
 // --- display strings -----------------------------------------------------
 eq(M.tooltipText(M.initialView()), "LensGuard \u2014 checking the camera\u2026", "loading tooltip")
-const idleView = { status: "idle", users: [], errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null }
-eq(M.tooltipText(idleView), "LensGuard \u2014 camera idle", "idle tooltip")
-const actView = { status: "active", users: holderA, errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null }
+const idleView = { status: "idle", users: [], errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null, history: [], openedAt: {} }
+eq(M.tooltipText(idleView, 100000), "LensGuard \u2014 camera idle", "idle tooltip")
+const idleAfterClose = { status: "idle", users: [], errorKind: "", message: "", at: 9000,
+  lastEvent: { kind: "closed", at: 8000, entry: { pid: "5", command: "ffmpeg", device: "/dev/video0" } },
+  history: [], openedAt: {} }
+has(M.tooltipText(idleAfterClose, 10000), "ffmpeg released the camera",
+  "recent close gets a calm tooltip return note")
+eq(M.tooltipText(idleAfterClose, 100000), "LensGuard \u2014 camera idle",
+  "old close note is not shown forever")
+const actView = { status: "active", users: holderA, errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null, history: [], openedAt: {} }
 has(M.tooltipText(actView), "example-cam (PID 4102)", "active tooltip names the process")
 has(M.tooltipText(actView), "Camera in use", "active tooltip states camera in use")
 eq(M.lastEventText(idleView), "", "no last event -> empty line")
 eq(M.lastEventText({ status: "idle", users: [], errorKind: "", message: "", at: 1, consecutiveFailures: 0,
-  lastEvent: { kind: "opened", at: 1, entry: holderA[0] } }),
+  lastEvent: { kind: "opened", at: 1, entry: holderA[0] }, history: [], openedAt: {} }),
   "example-cam (PID 4102) opened the camera", "last event text")
+eq(M.formatTime(0), "", "formatTime(0) is empty")
+has(M.formatTime(Date.now()), ":", "formatTime renders a time")
+eq(M.sinceText(0), "", "sinceText(0) is empty")
 
-// --- entryKey / diffUsers direct -----------------------------------------
+// --- state file ----------------------------------------------------------
+const stText = M.stateToText({ status: "active", users: holderA, errorKind: "", message: "", at: 5000,
+  consecutiveFailures: 0,
+  lastEvent: { kind: "opened", at: 5000, entry: holderA[0] },
+  history: [{ kind: "opened", at: 5000, pid: "4102", command: "example-cam", user: "demo", device: "/dev/video0" }],
+  openedAt: { "4102": 5000 } })
+has(stText, "version", "state text has a version")
+has(stText, "example-cam", "state text includes the history")
+has(stText, "opened", "state text includes the event kind")
+const restoredHist = M.historyFromStateText(stText)
+eq(restoredHist.length, 1, "history round-trips from the state file")
+eq(restoredHist[0].command, "example-cam", "history entry survives")
+eq(M.historyFromStateText("garbage").length, 0, "broken state file -> empty history")
+eq(M.historyFromStateText("").length, 0, "empty state file -> empty history")
+const sc = M.writeStateCommandArgs("/home/u/.local/state/lensguard/state.json", "{}")
+eq(sc[0], "bash", "state write via bash")
+has(sc[2], "umask 077", "state file written mode 600 from the first byte")
+has(sc[2], "state.json.tmp.$$", "state write uses a temp file")
+has(sc[2], "mv -f", "state write is atomic")
+
+// --- notifications -------------------------------------------------------
+const notifProc = { pid: "9001", command: "ffmpeg", user: "demo", devices: ["/dev/video0"] }
+eq(M.shouldNotifyOnOpen(notifProc, M.DEFAULT_WHITELIST), true, "unknown process should notify")
+eq(M.shouldNotifyOnOpen({ pid: "1", command: "zoom" }, M.DEFAULT_WHITELIST), false,
+  "whitelisted process stays calm")
+has(M.notifySummary(notifProc), "ffmpeg", "summary names the command")
+has(M.notifySummary(notifProc), "9001", "summary names the PID")
+const ng = M.notifGateCommandArgs("/tmp/lg.gate", "opened|9001", "inst-A", 25)
+eq(ng[0], "bash", "gate via bash")
+has(ng[2], "flock", "gate uses flock")
+has(ng[2], "prevme", "gate is instance-aware (a twin is skipped, self is not)")
+has(ng[2], "echo skip", "gate can skip (twin instance)")
+
+// --- entryKey / diffUsers direct (device-level helper retained) ----------
 eq(M.entryKey(holderA[0]), "/dev/video0|4102", "entry key device|pid")
 const d1 = M.diffUsers([holderA[0]], [])
-eq(d1.opened.length, 0, "diff: nothing opened")
-eq(d1.closed.length, 1, "diff: one closed")
+eq(d1.opened.length, 0, "device diff: nothing opened")
+eq(d1.closed.length, 1, "device diff: one closed")
 const d2 = M.diffUsers([], holderB)
-eq(d2.opened.length, 1, "diff: one opened")
-eq(d2.closed.length, 0, "diff: nothing closed")
+eq(d2.opened.length, 1, "device diff: one opened")
+eq(d2.closed.length, 0, "device diff: nothing closed")
 
 // =========================================================================
 console.log("LensGuard test-model.js — all assertions passed (" + Object.keys(M).length + " exports)")
