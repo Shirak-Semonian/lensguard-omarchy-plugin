@@ -515,6 +515,35 @@ ok(!/^  Process \{/m.test(srcPanel),
   "Panel: no top-level reusable Process (investigate runs on a fresh object)")
 ok(/id: investigateTaskComponent/.test(srcPanel), "Panel: investigate factory present")
 
+// --- regression: notification phase kinds map onto the _notifTask slot ----
+// LG-5 live doorloop on 2c1026d caught a silent notification death:
+// startNotifPhase() runs tasks with taskKind "notifGate"/"notifSend", but
+// ioTaskSlot()/clearIoTaskSlot() only mapped the watchdog key "notif" — so
+// handleIoTaskExited() saw ioTaskSlot(kind) === null for EVERY notification
+// task, treated it as a stale runner (releaseIoTask) and dropped it before
+// the gate output was read. The send phase was unreachable, _notifTask was
+// never cleared and the queue died silently. This guard fails whenever a
+// notification phase kind is added (or renamed) without being mapped to the
+// SAME slot as "notif" in both functions — the exact stale-drop class.
+const sliceFn = (name) => {
+  const i = srcBar.indexOf("function " + name)
+  ok(i >= 0, "BarWidget defines " + name + " (source guard target)")
+  const j = srcBar.indexOf("\n  }\n", i)
+  return srcBar.slice(i, j < 0 ? srcBar.length : j)
+}
+const ioSlotSrc = sliceFn("ioTaskSlot")
+const clearSlotSrc = sliceFn("clearIoTaskSlot")
+const recSrc = sliceFn("recoverIoTask")
+for (const nk of ["notif", "notifGate", "notifSend"]) {
+  ok(ioSlotSrc.includes('"' + nk + '"') && ioSlotSrc.includes("root._notifTask"),
+    "ioTaskSlot maps \"" + nk + "\" onto _notifTask (notification tasks are never stale)")
+  ok(clearSlotSrc.includes('"' + nk + '"') && clearSlotSrc.includes("root._notifTask"),
+    "clearIoTaskSlot maps \"" + nk + "\" onto _notifTask (queue slot clears on exit)")
+}
+ok(recSrc.includes('kind = "notif"'),
+  "recoverIoTask normalizes the raw phase kinds to \"notif\" (watchdog kill path recovers)")
+
+
 // --- bar process text (showProcessInBar / compactMode) --------------------
 const idleView2 = { status: "idle", users: [], errorKind: "", message: "", at: 1, consecutiveFailures: 0, lastEvent: null, history: [], openedAt: {} }
 eq(M.barProcessText(idleView2, M.DEFAULT_WHITELIST), "", "idle -> no bar text")

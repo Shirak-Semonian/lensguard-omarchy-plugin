@@ -575,11 +575,22 @@ BarWidget {
   // the child, second strike drops the wedged object and recovers the task
   // (writes are idempotent full-file writes, so a retry is always safe).
 
+  // The notification phases run with their PHASE kind ("notifGate"/
+  // "notifSend" — see startNotifPhase) while the heartbeat watchdog uses the
+  // family key "notif": all three must map onto the SAME _notifTask slot.
+  // When a phase kind was missing here, handleIoTaskExited() saw
+  // ioTaskSlot(kind) === null for every notification task, treated it as a
+  // stale runner and dropped it before the gate output was read — the send
+  // phase was unreachable and the notification queue died silently (LG-5
+  // live doorloop). Every notification phase kind MUST stay mapped here;
+  // test-model.js guards this consistency.
   function ioTaskSlot(kind) {
     if (kind === "state") return root._stateWriter
     if (kind === "config") return root._configWriter
     if (kind === "reset") return root._resetWriter
-    if (kind === "notif") return root._notifTask
+    if (kind === "notif" || kind === "notifGate" || kind === "notifSend") {
+      return root._notifTask
+    }
     return null
   }
 
@@ -587,7 +598,8 @@ BarWidget {
     if (kind === "state" && root._stateWriter === task) root._stateWriter = null
     else if (kind === "config" && root._configWriter === task) root._configWriter = null
     else if (kind === "reset" && root._resetWriter === task) root._resetWriter = null
-    else if (kind === "notif" && root._notifTask === task) root._notifTask = null
+    else if ((kind === "notif" || kind === "notifGate" || kind === "notifSend")
+      && root._notifTask === task) root._notifTask = null
   }
 
   function releaseIoTask(task, kind) {
@@ -758,6 +770,10 @@ BarWidget {
   // SEND phase is treated as delivered — never resent — to preserve the
   // "exactly one notification" guarantee.
   function recoverIoTask(kind) {
+    // The watchdog reports the family key "notif", but the kill path in
+    // handleIoTaskExited() reports the raw phase kind; normalize so both
+    // reach the same notification recovery branch.
+    if (kind === "notifGate" || kind === "notifSend") kind = "notif"
     if (kind === "state") {
       if (root._stateRecovered) {
         console.warn("LensGuard: event history write keeps failing; the next camera event will write the full history again")
@@ -985,8 +1001,11 @@ BarWidget {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
-    function allow(command) { root.allowCommand(command) }
-    function deny(command) { root.denyCommand(command) }
+    // Typed parameters keep the IPC layer quiet: an untyped argument would
+    // cross the handler boundary as QVariant and log
+    // "cannot be used across IPC" on every load (log hygiene, LG-5).
+    function allow(command: string) { root.allowCommand(command) }
+    function deny(command: string) { root.denyCommand(command) }
     function resetConfig() { root.resetConfigToDefaults() }
   }
 
