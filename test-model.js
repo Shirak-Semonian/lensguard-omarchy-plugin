@@ -8,11 +8,11 @@ const ok = (v, msg) => assert.ok(v, msg)
 const has = (haystack, needle, msg) => assert.ok(String(haystack).includes(needle), msg)
 
 // ---------------------------------------------------------------------------
-// Example probe captures — synthetic fixtures, fictional values only
+// Example probe captures — synthetic fixtures, fictional values only.
 // ---------------------------------------------------------------------------
-// Two processes held /dev/video0 + /dev/video1 open at once: a `bash` fd
-// holder and a streaming `v4l2-ctl`. lsof prints one group per process;
-// v4l2-ctl opened video0 twice (mmap + fd) and also holds the video1
+// Two fictional processes hold /dev/video0 + /dev/video1 open at once: a
+// `bash` fd holder and a streaming `v4l2-ctl`. lsof prints one group per
+// process; v4l2-ctl opened video0 twice (mmap + fd) and also holds the video1
 // metadata device, so both parsers must dedupe to one entry per (pid, device).
 
 const LSOF_FIXTURE = [
@@ -33,10 +33,10 @@ const LSOF_FIXTURE = [
 
 const FUSER_FIXTURE = [
   "                     USER        PID ACCESS COMMAND",
-  "/dev/video0:         demo    77001 F.... bash",
-  "                     demo    77002 F...m v4l2-ctl",
-  "/dev/video1:         demo    77001 F.... bash",
-  "                     demo    77002 F.... v4l2-ctl",
+  "/dev/video0:         demo      77001 F.... bash",
+  "                     demo      77002 F...m v4l2-ctl",
+  "/dev/video1:         demo      77001 F.... bash",
+  "                     demo      77002 F.... v4l2-ctl",
   ""
 ].join("\n")
 

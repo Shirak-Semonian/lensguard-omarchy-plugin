@@ -1,3 +1,8 @@
 node_modules/
 *.log
 .DS_Store
+
+# Runtime state and local config must never be committed
+state.json
+config.json
+*.bak

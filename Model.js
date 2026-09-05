@@ -138,7 +138,7 @@ function probeCommand() {
 // Parsing: lsof -F pcun
 // ---------------------------------------------------------------------------
 // Record format (one group per process, fields can repeat/order freely):
-//   p77000        process id
+//   p77000          process id
 //   cv4l2-ctl       command name
 //   u1000           user id
 //   n/dev/video0    open file path (repeatable; dedupe per process)
@@ -198,9 +198,9 @@ function parseLsofOutput(text) {
 // ---------------------------------------------------------------------------
 // Table format:
 //                      USER        PID ACCESS COMMAND
-//   /dev/video0:         demo    77001 F.... bash
-//                        demo    77002 F...m v4l2-ctl
-//   /dev/video1:         demo    77001 F.... bash
+//   /dev/video0:         demo      77001 F.... bash
+//                        demo      77002 F...m v4l2-ctl
+//   /dev/video1:         demo      77001 F.... bash
 // The first row of a device sits on the `/dev/videoN:` header line; the
 // column header row is skipped.
 

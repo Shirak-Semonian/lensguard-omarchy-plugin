@@ -16,6 +16,22 @@ used.
 
 ![LensGuard preview](assets/preview.png)
 
+## Features
+
+- **Webcam watch without privileges** — probes `/dev/video*` with `lsof`
+  (machine-readable, primary) or `fuser -v` (automatic fallback); no kernel
+  module, no daemon, no root.
+- **Clear bar state** — the shield-and-lens glyph is calm navy when the
+  camera is idle, yellow for a whitelisted app, red for an unknown process,
+  soft orange when detection is unavailable; state changes cross-fade.
+- **One alert per unknown open** — exactly one desktop notification when a
+  process that is not on your whitelist opens the camera, naming the command
+  and PID; whitelisted apps stay calm.
+- **Panel with context** — live holder cards (command, PID, user, device,
+  since), the last 20 camera events, whitelist management and settings.
+- **Local and quiet by default** — no network calls, no account, no API key;
+  config and history are plain files in your home directory.
+
 ## Why this works
 
 An application that uses the camera keeps the video device node (`/dev/video0`,
@@ -27,6 +43,35 @@ the browser process.
 Detection is done with the tools that are already on every Arch system:
 `lsof -F` (machine readable, primary) or `fuser -v` (fallback). No kernel
 module, no service, no privileged daemon.
+
+## Privacy & security
+
+LensGuard is a local observer, not a recorder:
+
+- **What it sees.** Each poll lists which processes hold a `/dev/video*`
+  node open: numeric PID, command name, user and device path — the same
+  information `lsof`/`fuser` already print for your own user. It never
+  opens the camera, never captures a frame and never records audio or
+  video.
+- **No network.** LensGuard makes no network calls of any kind: no
+  telemetry, no update check, no account, no API key. There is no endpoint
+  configuration anywhere in the plugin.
+- **Why the whitelist.** Camera use by a whitelisted app is behaviour you
+  already expect, so it is shown calmly (yellow bar state, no popup).
+  Anything NOT on the list turns the bar red and raises exactly one alert —
+  that is the moment LensGuard exists for: an app you have not approved is
+  using your lens. Matching is deliberately strict: an entry matches a
+  command only at a `-`/`_` boundary or at the exact end (`zoom` never
+  matches `zoommalware`), so trusting an app never silently trusts
+  lookalikes.
+- **Local state.** The whitelist and settings live in
+  `~/.config/lensguard/config.json`; the last 20 camera events live in
+  `~/.local/state/lensguard/state.json`. Both are written atomically with
+  mode 600 (owner-only) and never leave your machine. A config reset keeps
+  a `config.json.bak` next to the file.
+- **No escalation.** “Investigate” in the panel reads the process’s own
+  `/proc/<pid>/cmdline` under your normal user rights. LensGuard never asks
+  for elevation and never touches other users’ processes.
 
 ## Statuses
 
@@ -128,6 +173,28 @@ omarchy plugin enable io.github.shirak-semonian.lensguard --section right
 omarchy restart shell
 ```
 
+## Uninstall
+
+Disable and remove the plugin, then restart the shell:
+
+```sh
+omarchy plugin disable io.github.shirak-semonian.lensguard
+omarchy plugin remove io.github.shirak-semonian.lensguard --yes
+omarchy restart shell
+```
+
+No widget stays running afterwards. To also delete the local data LensGuard
+created (whitelist, settings and event history), remove its two data
+directories:
+
+```sh
+rm -rf ~/.config/lensguard ~/.local/state/lensguard
+```
+
+For a manual (folder-copy) install, remove
+`~/.config/omarchy/plugins/io.github.shirak-semonian.lensguard`, drop the
+widget from the bar layout and restart the shell.
+
 ## Requirements
 
 - Omarchy shell (Quickshell-based bar)
@@ -167,7 +234,8 @@ Layout (same architecture as the other Omarchy widgets by the same author):
 - `Panel.qml` — the details panel: live status, per-process cards with
   Allow/Investigate, event history, whitelist management and the Settings
   section (interval, notifications, bar text, reset).
-- `test-model.js` — plain-`assert` Node tests, including real probe captures.
+- `test-model.js` — plain-`assert` Node tests with synthetic example
+  captures (fictional PIDs/users — no machine data).
 - `assets/` — icons (idle/known/unknown/error) and the dummy preview.
 - `icon-source.svg`, `preview-source.svg` — editable artwork sources.
 
