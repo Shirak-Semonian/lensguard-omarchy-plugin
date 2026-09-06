@@ -14,7 +14,7 @@ used.
 > `lsof` exposes locally. State and whitelist stay in your own files
 > (`~/.local/state/lensguard/`, `~/.config/lensguard/`).
 
-![LensGuard preview](assets/preview.png)
+![LensGuard preview](preview.png)
 
 ## Features
 
@@ -236,8 +236,8 @@ Layout (same architecture as the other Omarchy widgets by the same author):
   section (interval, notifications, bar text, reset).
 - `test-model.js` — plain-`assert` Node tests with synthetic example
   captures (fictional PIDs/users — no machine data).
-- `assets/` — icons (idle/known/unknown/error) and the dummy preview.
-- `icon-source.svg`, `preview-source.svg` — editable artwork sources.
+- `assets/` — icons (idle/known/unknown/error).
+- `icon-source.svg` — editable artwork source.
 
 User-facing text is English. Comments in the code may be Dutch.
 
