@@ -29,7 +29,7 @@
   "barWidget": {
     "displayName": "LensGuard",
     "description": "Camera activity guard — shows when a process uses the webcam",
-    "category": "Security",
+    "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"
   }
