@@ -24,6 +24,15 @@ import "Model.js" as Model
 // Config problems never stop the guard: the widget keeps working on the
 // defaults and the panel shows a calm note (never the file content) with a
 // one-click reset.
+//
+// LG-7 (HANCORE security baseline): every Text in this file sets
+// textFormat: Text.PlainText, without exception. The process cards, the
+// /proc/<pid>/cmdline investigate output, the history rows and the whitelist
+// entries are filled from values a local process controls (its own name/user),
+// so they must never be interpreted as rich text — no markup, no
+// image/file resource loads. Model.js additionally caps each of those fields
+// (MAX_COMMAND_CHARS, MAX_USER_CHARS, MAX_INVESTIGATE_CHARS,
+// MAX_WHITELIST_ENTRY_CHARS) before it reaches this file.
 Panel {
   id: root
   moduleName: "io.github.shirak-semonian.lensguard"
@@ -281,6 +290,7 @@ Panel {
               spacing: Style.space(2)
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.statusText
                 color: root.statusColor
@@ -291,6 +301,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.statusSubText
                 color: root.isIdle ? root.success : root.dim
@@ -310,6 +321,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.isLoading
             text: "Waiting for the first camera check\u2026"
@@ -356,6 +368,7 @@ Panel {
                       spacing: 0
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: modelData.command || "?"
                         color: root.foreground
@@ -366,6 +379,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: "PID " + modelData.pid
                           + (modelData.user ? "  \u00b7  user " + modelData.user : "")
@@ -378,6 +392,7 @@ Panel {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       width: Style.space(86)
                       anchors.verticalCenter: parent.verticalCenter
                       text: modelData.known ? "known app" : "unknown"
@@ -390,6 +405,7 @@ Panel {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     width: parent.width
                     text: "devices: " + modelData.devices.join(", ")
                     color: root.dim
@@ -415,6 +431,7 @@ Panel {
                       spacing: Style.space(6)
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: "Unknown process \u2014 not on your whitelist"
                         color: root.danger
@@ -425,6 +442,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: "Allow it to use the camera without alerts, or investigate its full command line."
                         color: root.dim
@@ -463,6 +481,7 @@ Panel {
                       // Investigate result: the full command line of this pid
                       // (read from /proc/<pid>/cmdline, argv only).
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         visible: root._investigatePid === String(modelData.pid)
                           && root._investigateOutput !== ""
@@ -475,6 +494,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         visible: root._investigatePid === String(modelData.pid)
                           && root._investigateRunning
@@ -485,6 +505,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         visible: root._investigatePid === String(modelData.pid)
                           && !root._investigateRunning
@@ -509,6 +530,7 @@ Panel {
             visible: hostWidget && hostWidget.configErrorKind !== ""
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Whitelist config needs attention"
               color: root.warn
@@ -519,6 +541,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "The config file is not readable or not valid JSON. "
                 + "LensGuard keeps working with the default settings."
@@ -530,6 +553,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: root.configPath
               color: root.dim
@@ -581,6 +605,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.view.history.length === 0
             text: "No camera activity yet \u2014 opened and closed events will appear here."
@@ -606,6 +631,7 @@ Panel {
                 height: Style.space(18)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   width: Style.space(56)
                   text: Model.formatTime(modelData.at)
@@ -615,6 +641,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   width: Style.space(64)
                   text: modelData.kind === "opened" ? "opened" : "closed"
@@ -625,6 +652,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   width: content.width - Style.space(56) - Style.space(64) - Style.space(12)
                   text: modelData.command + "  (PID " + modelData.pid + ")"
@@ -649,6 +677,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: "Apps listed here may use the camera without an alert "
               + "(calm yellow \"known app\" status). Everything else is "
@@ -675,6 +704,7 @@ Panel {
                 height: Style.space(24)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   width: content.width - Style.space(90)
                   text: "• " + modelData
@@ -791,6 +821,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Stored in " + root.configPath + " (mode 600). "
                 + "Reset restores defaults and keeps config.json.bak."
@@ -813,6 +844,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: "Probes /dev/video* every "
               + root.intervalText(root.config.pollIntervalMs) + ". "
@@ -841,7 +873,10 @@ Panel {
       command: []
       stdout: StdioCollector {
         waitForEnd: true
-        onStreamFinished: root._investigateOutput = text.trim()
+        // The command line is process-controlled: cap it for display here
+        // (never show more than MAX_INVESTIGATE_CHARS) — the Text above
+        // renders it as plain text.
+        onStreamFinished: root._investigateOutput = Model.investigateOutputText(text)
       }
       onExited: function(exitCode) {
         root.handleInvestigateExited(investigateTaskProc, exitCode)

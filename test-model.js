@@ -573,5 +573,139 @@ const d2 = M.diffUsers([], holderB)
 eq(d2.opened.length, 1, "device diff: one opened")
 eq(d2.closed.length, 0, "device diff: nothing closed")
 
+// --- LG-7: plain-text rendering + bounded process-controlled fields --------
+// A process names itself, so its command, its user id and its /proc command
+// line are attacker-controlled strings. Two guarantees are asserted:
+//   (a) such a value is carried through Model.js VERBATIM (never decoded,
+//       stripped or otherwise "interpreted"), and every Text sink in the QML
+//       is pinned to Text.PlainText — markup-like content is shown literally;
+//   (b) every such field is truncated to its documented cap before it reaches
+//       the view, the state file or a notification.
+eq(M.MAX_COMMAND_CHARS, 120, "process name cap")
+eq(M.MAX_USER_CHARS, 32, "user cap")
+eq(M.MAX_DEVICE_CHARS, 64, "device path cap")
+eq(M.MAX_INVESTIGATE_CHARS, 512, "investigate output cap")
+eq(M.MAX_WHITELIST_ENTRY_CHARS, 64, "whitelist entry cap")
+ok(M.MAX_INVESTIGATE_CHARS < M.MAX_OUTPUT_CHARS,
+  "the UI cap is far below the 64 KiB parse-safety cap")
+
+// (a) markup-like values stay literal data — nothing in Model.js treats them
+// as markup (no entity decoding, no tag stripping, no escaping).
+const MARKUP_NAME = '<b>cam</b><img src="file:///etc/passwd">'
+const MARKUP_USER = "&lt;u&gt;"
+const markupProbe = M.parseProbeOutput(0,
+  ["p77010", "c" + MARKUP_NAME, "u" + MARKUP_USER, "n/dev/video0", ""].join("\n"))
+eq(markupProbe.ok, true, "probe with a markup-like command parses")
+eq(markupProbe.users[0].command, MARKUP_NAME,
+  "markup-like process name is carried verbatim (no markup handling in Model)")
+eq(markupProbe.users[0].user, MARKUP_USER,
+  "HTML entities in a process value are NOT decoded (kept literal)")
+eq(M.boundedText(MARKUP_NAME, M.MAX_COMMAND_CHARS), MARKUP_NAME,
+  "boundedText never re-escapes or rewrites the value it is given")
+const markupView = {
+  status: "active",
+  users: [{ device: "/dev/video0", pid: "77010", user: MARKUP_USER, command: MARKUP_NAME }],
+  openedAt: { "77010": 1 }, history: [], lastEvent: null
+}
+eq(M.barProcessText(markupView, M.DEFAULT_WHITELIST), MARKUP_NAME,
+  "the bar label carries the markup-like name literally")
+has(M.notifySummary({ pid: "77010", command: MARKUP_NAME }), MARKUP_NAME,
+  "the notification summary carries the markup-like name literally")
+
+// ...and the render side: every Text element in both QML files must set
+// Text.PlainText, so a value like the one above can never be interpreted as
+// rich text (no markup, no image/file resource loads). Blocks are scanned
+// with brace counting, so the property may sit anywhere in the element.
+function textBlocks(src) {
+  const lines = src.split("\n")
+  const blocks = []
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*Text\s*\{$/.test(lines[i])) continue
+    let depth = 0
+    const body = []
+    for (let j = i; j < lines.length; j++) {
+      for (const ch of lines[j]) {
+        if (ch === "{") depth++
+        else if (ch === "}") depth--
+      }
+      body.push(lines[j])
+      if (depth <= 0) break
+    }
+    blocks.push(body.join("\n"))
+  }
+  return blocks
+}
+for (const [name, src] of [["Panel.qml", srcPanel], ["BarWidget.qml", srcBar]]) {
+  const blocks = textBlocks(src)
+  ok(blocks.length > 0, name + ": Text elements found (source guard target)")
+  eq(blocks.length, (src.match(/^\s*Text\s*\{$/gm) || []).length,
+    name + ": every Text element was scanned")
+  for (const b of blocks) {
+    has(b, "textFormat: Text.PlainText",
+      name + ": Text sink renders process-controlled values as plain text")
+  }
+  ok(!/textFormat:\s*Text\.(?!PlainText)/.test(src),
+    name + ": no Text sink falls back to AutoText/RichText/StyledText/MarkdownText")
+}
+has(srcPanel, "Model.investigateOutputText(text)",
+  "Panel: the /proc cmdline preview is bounded through Model before display")
+has(srcBar, "Model.normalizeWhitelistEntry(command)",
+  "BarWidget: a whitelist entry added from a process name is normalized + bounded")
+
+// (b) every process-controlled field is truncated to its cap before it enters
+// the view, the state file or a notification.
+const LONG_NAME = "A".repeat(500)
+const LONG_USER = "u".repeat(200)
+const LONG_PID = "9".repeat(50)
+const cappedProbe = M.parseProbeOutput(0,
+  ["p" + LONG_PID, "c" + LONG_NAME, "u" + LONG_USER, "n/dev/video0", ""].join("\n"))
+eq(cappedProbe.users[0].command.length, M.MAX_COMMAND_CHARS,
+  "an over-long process name is truncated to MAX_COMMAND_CHARS")
+eq(cappedProbe.users[0].user.length, M.MAX_USER_CHARS,
+  "an over-long user is truncated to MAX_USER_CHARS")
+eq(cappedProbe.users[0].pid.length, M.MAX_PID_CHARS,
+  "an over-long pid is truncated to MAX_PID_CHARS")
+eq(M.parseLsofOutput(["p77013", "c" + LONG_NAME, "u1000", "n/dev/video0", ""].join("\n"))[0]
+  .command.length, M.MAX_COMMAND_CHARS, "the lsof parser caps the command")
+eq(M.parseFuserOutput("/dev/video0:   " + LONG_USER + "   77014 F.... " + LONG_NAME)[0]
+  .command.length, M.MAX_COMMAND_CHARS, "the fuser fallback parser caps the command too")
+eq(M.parseFuserOutput("/dev/video0:   " + LONG_USER + "   77014 F.... x")[0].user.length,
+  M.MAX_USER_CHARS, "the fuser fallback parser caps the user too")
+eq(M.parseProbeOutput(0,
+  ["p77015", "cbash", "u1000", "n/dev/video" + "9".repeat(200), ""].join("\n")).users.length, 0,
+  "a pathological device path is rejected instead of entering the holder list")
+const restoredCapped = M.historyFromStateText(JSON.stringify({
+  version: 1,
+  history: [{ kind: "opened", at: 1, pid: LONG_PID, command: LONG_NAME, user: LONG_USER,
+    device: "/dev/video" + "1".repeat(200) }]
+}))
+eq(restoredCapped[0].command.length, M.MAX_COMMAND_CHARS, "a restored history command is capped")
+eq(restoredCapped[0].user.length, M.MAX_USER_CHARS, "a restored history user is capped")
+eq(restoredCapped[0].device.length, M.MAX_DEVICE_CHARS, "a restored history device is capped")
+eq(restoredCapped[0].pid.length, M.MAX_PID_CHARS, "a restored history pid is capped")
+const cappedView = {
+  status: "active",
+  users: [{ device: "/dev/video0", pid: "77016", user: LONG_USER, command: LONG_NAME }],
+  openedAt: { "77016": 1 }, history: [], lastEvent: null
+}
+eq(M.barProcessText(cappedView, M.DEFAULT_WHITELIST).length, M.MAX_COMMAND_CHARS,
+  "the bar label can never exceed the command cap")
+const longEntry = "E".repeat(300)
+eq(M.normalizeWhitelistEntry(longEntry).length, M.MAX_WHITELIST_ENTRY_CHARS,
+  "a whitelist entry created from a process name is capped")
+eq(M.normalizeWhitelistEntry("  Camera  "), "camera",
+  "a whitelist entry is still trimmed and lowercased")
+const cfgEntry = M.parseConfig(JSON.stringify({ whitelist: ["  " + longEntry] }))
+eq(cfgEntry.ok, true, "a config with a very long whitelist entry still parses")
+ok(cfgEntry.config.whitelist[0].length <= M.MAX_WHITELIST_ENTRY_CHARS,
+  "config whitelist entries are capped as well")
+eq(M.investigateOutputText("x".repeat(5000)).length, M.MAX_INVESTIGATE_CHARS,
+  "the investigate output is capped to MAX_INVESTIGATE_CHARS")
+eq(M.investigateOutputText("  cam --flag\n"), "cam --flag",
+  "the investigate output is still trimmed")
+eq(M.investigateOutputText(null), "", "no investigate output -> empty string")
+eq(M.boundedText(undefined, 10), "", "boundedText(undefined) -> empty string")
+eq(M.boundedText("abc", 10), "abc", "boundedText leaves short values untouched")
+
 // =========================================================================
 console.log("LensGuard test-model.js — all assertions passed (" + Object.keys(M).length + " exports)")

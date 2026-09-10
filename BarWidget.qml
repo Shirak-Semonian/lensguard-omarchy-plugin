@@ -45,6 +45,18 @@ import "Model.js" as Model
 //     smooth cross-fade between states; bar text only when the camera is in
 //     use.
 //
+// LG-7 (HANCORE security baseline): process names, user ids, device paths,
+// whitelist entries and /proc command lines are values a LOCAL PROCESS picks
+// for itself, so they are treated as untrusted text in two layers:
+//   * every Text sink in this widget and in Panel.qml sets
+//     textFormat: Text.PlainText — such a value can never be interpreted as
+//     rich text (no markup, no image/file resource loads);
+//   * Model.js caps each such field to a small documented maximum before it
+//     enters the view, the state file or a notification
+//     (MAX_COMMAND_CHARS/MAX_USER_CHARS/MAX_DEVICE_CHARS/MAX_PID_CHARS).
+//     Bounding is also what protects the host widget's tooltip, the one text
+//     sink we do not own (Commons WidgetButton renders it itself).
+//
 // Detection: one cheap probe per second asks lsof (fallback fuser) which
 // processes hold /dev/video* open. No polling spam by construction:
 //   * at most ONE probe in flight, at most one per configured interval
@@ -331,7 +343,10 @@ BarWidget {
   // full config atomically, mode 600 from the first byte.
   function setWhitelistEntry(command, allowed) {
     if (!command) return
-    var name = String(command).trim().toLowerCase()
+    // Normalize + bound in Model.js: the entry came from a process name, so it
+    // is capped (MAX_WHITELIST_ENTRY_CHARS) before it is written to the config
+    // and rendered in the panel list.
+    var name = Model.normalizeWhitelistEntry(command)
     if (!name) return
     var list = (root.config.whitelist || []).slice()
     var idx = list.indexOf(name)
@@ -1075,6 +1090,7 @@ BarWidget {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: barProcessLabel
       anchors.verticalCenter: parent.verticalCenter
       visible: root.processTextEnabled && root.processBarText !== ""

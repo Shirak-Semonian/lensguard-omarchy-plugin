@@ -43,6 +43,23 @@ var NOTIF_GATE_FLOCK_WAIT_S = 3;       // bounded flock wait in the gate (s)
 var PROBE_ERROR_AFTER = 2;             // consecutive transient failures -> error
 var MAX_OUTPUT_CHARS = 65536;          // parser cap (64 KiB), defensive
 
+// Bounded fields (HANCORE security baseline, LG-7). Every value that comes
+// from a process LensGuard does NOT control — its command name (lsof `c` /
+// fuser COMMAND), the user id behind it, the device path, the
+// /proc/<pid>/cmdline preview and any whitelist entry created from such a
+// command — is truncated to a small, documented maximum BEFORE it enters the
+// reducer, the panel, the bar, a notification or the state file. A local
+// process picks its own name, so unbounded text could stretch a bar slot or a
+// panel card, bloat state.json, and widen the blast radius of any rich-text
+// interpretation of those values. MAX_OUTPUT_CHARS above remains what it is:
+// a parse-safety bound for the whole probe stream, far too large to ever show.
+var MAX_COMMAND_CHARS = 120;           // process name shown anywhere in the UI
+var MAX_USER_CHARS = 32;               // user behind the camera
+var MAX_DEVICE_CHARS = 64;             // device path (/dev/videoNN is ~12 chars)
+var MAX_PID_CHARS = 16;                // pid as printed by the probe (<= 7 digits)
+var MAX_INVESTIGATE_CHARS = 512;       // /proc/<pid>/cmdline preview in the panel
+var MAX_WHITELIST_ENTRY_CHARS = 64;    // one whitelist entry (UI + config file)
+
 var ERR_NO_TOOL = "__LG_ERR_NO_TOOL__";
 var ERR_NO_DEVICE = "__LG_ERR_NO_DEVICE__";
 
@@ -112,6 +129,18 @@ function errorMessageFor(kind) {
   return "camera check failed";
 }
 
+// Truncate one value that came from an untrusted source (a process name, a
+// user id, a device path, a /proc preview) to a documented maximum. Always
+// returns a string, so parse callers need no extra null guards. Truncation
+// only shortens — it never re-interprets, escapes or sanitizes the content;
+// the UI renders these values as plain text (Text.PlainText, LG-7).
+function boundedText(value, max) {
+  var s = value == null ? "" : String(value);
+  var limit = Number(max);
+  if (!isFinite(limit) || limit < 0) return s;
+  return s.length > limit ? s.substring(0, limit) : s;
+}
+
 // ---------------------------------------------------------------------------
 // Probe command (pure argv construction — the widget spawns exactly this)
 // ---------------------------------------------------------------------------
@@ -165,16 +194,20 @@ function parseLsofOutput(text) {
     var code = line.charAt(0);
     var value = line.substring(1);
     if (code === "p") {
-      if (!byPid[value]) {
-        byPid[value] = { pid: value, command: "", user: "", devices: {} };
-        order.push(value);
+      // The pid is bounded like every other probe value: diffing/history key
+      // off this string, so a spoofed or absurdly long pid can never grow the
+      // state file or a display row.
+      var pidKey = boundedText(value, MAX_PID_CHARS);
+      if (!byPid[pidKey]) {
+        byPid[pidKey] = { pid: pidKey, command: "", user: "", devices: {} };
+        order.push(pidKey);
       }
-      current = byPid[value];
+      current = byPid[pidKey];
     } else if (current) {
       if (code === "c") {
-        current.command = value;
+        current.command = boundedText(value, MAX_COMMAND_CHARS);
       } else if (code === "u") {
-        current.user = value;
+        current.user = boundedText(value, MAX_USER_CHARS);
       } else if (code === "n" && isVideoDevice(value)) {
         current.devices[value] = true;
       }
@@ -222,7 +255,7 @@ function parseFuserOutput(text) {
     if (!trimmed) continue;
     var headerMatch = /^(\/dev\/video\d+):\s*(.*)$/.exec(trimmed);
     if (headerMatch) {
-      device = headerMatch[1];
+      device = boundedText(headerMatch[1], MAX_DEVICE_CHARS);
       trimmed = headerMatch[2].trim();
       if (!trimmed) continue;
     }
@@ -232,16 +265,19 @@ function parseFuserOutput(text) {
     if (tokens.length < 3) continue; // not a data row
     users.push({
       device: device,
-      pid: tokens[1],
-      user: tokens[0],
-      command: tokens.slice(3).join(" ") || tokens[2]
+      pid: boundedText(tokens[1], MAX_PID_CHARS),
+      user: boundedText(tokens[0], MAX_USER_CHARS),
+      command: boundedText(tokens.slice(3).join(" ") || tokens[2], MAX_COMMAND_CHARS)
     });
   }
   return sortUsers(users);
 }
 
 function isVideoDevice(path) {
-  return /^\/dev\/video\d+$/.test(path);
+  // A real device path is /dev/videoN with a short number: the length bound
+  // keeps a pathological "n" field out of the holder list and the state file.
+  var s = path == null ? "" : String(path);
+  return s.length <= MAX_DEVICE_CHARS && /^\/dev\/video\d+$/.test(s);
 }
 
 // Entries are comparable/diffable and stable for display: sorted by pid, then
@@ -310,6 +346,11 @@ function parseProbeOutput(exitCode, raw) {
 
 // Group device-level user rows into process-level rows.
 // Returns [{ pid, command, user, devices: [...] }] sorted by pid.
+// This is the single point where probe rows become the process rows the whole
+// UI (panel cards, bar label, tooltip, history, notifications) is built from,
+// so every field is bounded here as well: parser bounds protect the view and
+// the state file at the source, and this bound protects every consumer even if
+// a row ever arrives from somewhere else (LG-7 defence in depth).
 function groupByProcess(users) {
   var byPid = {};
   var order = [];
@@ -318,13 +359,21 @@ function groupByProcess(users) {
     var u = list[i];
     if (!u || u.pid == null) continue;
     if (!byPid[u.pid]) {
-      byPid[u.pid] = { pid: u.pid, command: u.command || "", user: u.user || "", devices: [] };
+      byPid[u.pid] = {
+        pid: boundedText(u.pid, MAX_PID_CHARS),
+        command: boundedText(u.command, MAX_COMMAND_CHARS),
+        user: boundedText(u.user, MAX_USER_CHARS),
+        devices: []
+      };
       order.push(u.pid);
     }
     var p = byPid[u.pid];
-    if (!p.command && u.command) p.command = u.command;
-    if (!p.user && u.user) p.user = u.user;
-    if (u.device && p.devices.indexOf(u.device) === -1) p.devices.push(u.device);
+    if (!p.command && u.command) p.command = boundedText(u.command, MAX_COMMAND_CHARS);
+    if (!p.user && u.user) p.user = boundedText(u.user, MAX_USER_CHARS);
+    if (u.device) {
+      var dev = boundedText(u.device, MAX_DEVICE_CHARS);
+      if (p.devices.indexOf(dev) === -1) p.devices.push(dev);
+    }
   }
   var out = [];
   for (var oi = 0; oi < order.length; oi++) {
@@ -369,13 +418,15 @@ function capHistory(history) {
 }
 
 function entryForEvent(processRow) {
+  // History entries are rendered in the panel and persisted to state.json, so
+  // every field is bounded here as well (defence in depth, LG-7).
   return {
-    pid: processRow.pid,
-    command: processRow.command || "?",
-    user: processRow.user || "",
+    pid: boundedText(processRow.pid, MAX_PID_CHARS),
+    command: boundedText(processRow.command || "?", MAX_COMMAND_CHARS),
+    user: boundedText(processRow.user, MAX_USER_CHARS),
     devices: processRow.devices || [],
     device: (processRow.devices && processRow.devices.length > 0)
-      ? processRow.devices[0] : ""
+      ? boundedText(processRow.devices[0], MAX_DEVICE_CHARS) : ""
   };
 }
 
@@ -405,6 +456,17 @@ function isWhitelisted(command, whitelist) {
     if (commandMatches(command, list[i])) return true;
   }
   return false;
+}
+
+// Normalize ONE whitelist entry that came from a process command — both entries
+// read from the config file and entries the panel adds via "Allow" are stored
+// through this single function, so a process can never push an unbounded (or
+// differently cased) string into the config, the state file or the panel list.
+// Returns "" for an unusable entry (the caller decides whether that is a
+// no-op).
+function normalizeWhitelistEntry(value) {
+  var s = boundedText(value, MAX_WHITELIST_ENTRY_CHARS);
+  return s.trim().toLowerCase();
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +563,7 @@ function parseConfig(raw) {
     for (i = 0; i < obj.whitelist.length; i++) {
       var item = obj.whitelist[i];
       if (typeof item !== "string") continue;
-      var name = item.trim().toLowerCase();
+      var name = normalizeWhitelistEntry(item);
       if (!name) continue;
       if (clean.indexOf(name) === -1) clean.push(name);
     }
@@ -957,10 +1019,10 @@ function historyFromStateText(text) {
       out.push({
         kind: e.kind,
         at: Number(e.at) || 0,
-        pid: String(e.pid == null ? "" : e.pid),
-        command: String(e.command == null ? "?" : e.command),
-        user: String(e.user == null ? "" : e.user),
-        device: String(e.device == null ? "" : e.device)
+        pid: boundedText(e.pid == null ? "" : e.pid, MAX_PID_CHARS),
+        command: boundedText(e.command == null ? "?" : e.command, MAX_COMMAND_CHARS),
+        user: boundedText(e.user == null ? "" : e.user, MAX_USER_CHARS),
+        device: boundedText(e.device == null ? "" : e.device, MAX_DEVICE_CHARS)
       });
     }
     return out;
@@ -992,8 +1054,10 @@ function shouldNotifyOnOpen(processRow, whitelist, config) {
 }
 
 function notifySummary(processRow) {
-  return "LensGuard: camera opened by " + (processRow.command || "?")
-    + " (PID " + processRow.pid + ")";
+  // The summary lands in a desktop notification: bound it like every other
+  // process-controlled string (LG-7).
+  return "LensGuard: camera opened by " + boundedText(processRow.command || "?", MAX_COMMAND_CHARS)
+    + " (PID " + boundedText(processRow.pid, MAX_PID_CHARS) + ")";
 }
 
 // Short process label shown in the bar next to the icon while the camera is
@@ -1064,6 +1128,15 @@ function investigateCommand(pid) {
     "lensguard-investigate", String(pid)];
 }
 
+// The /proc/<pid>/cmdline preview the panel shows for an unknown process. A
+// command line is fully process-controlled and can be arbitrarily long, so it
+// is trimmed to MAX_INVESTIGATE_CHARS before it reaches the UI — the panel
+// renders it as plain text (Text.PlainText), never as rich text.
+function investigateOutputText(raw) {
+  var s = String(raw == null ? "" : raw).trim();
+  return boundedText(s, MAX_INVESTIGATE_CHARS);
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     DEFAULT_POLL_INTERVAL_MS: DEFAULT_POLL_INTERVAL_MS,
@@ -1077,6 +1150,12 @@ if (typeof module !== "undefined") {
     NOTIF_GATE_FLOCK_WAIT_S: NOTIF_GATE_FLOCK_WAIT_S,
     PROBE_ERROR_AFTER: PROBE_ERROR_AFTER,
     MAX_OUTPUT_CHARS: MAX_OUTPUT_CHARS,
+    MAX_COMMAND_CHARS: MAX_COMMAND_CHARS,
+    MAX_USER_CHARS: MAX_USER_CHARS,
+    MAX_DEVICE_CHARS: MAX_DEVICE_CHARS,
+    MAX_PID_CHARS: MAX_PID_CHARS,
+    MAX_INVESTIGATE_CHARS: MAX_INVESTIGATE_CHARS,
+    MAX_WHITELIST_ENTRY_CHARS: MAX_WHITELIST_ENTRY_CHARS,
     ERR_NO_TOOL: ERR_NO_TOOL,
     ERR_NO_DEVICE: ERR_NO_DEVICE,
     HISTORY_LIMIT: HISTORY_LIMIT,
@@ -1089,6 +1168,9 @@ if (typeof module !== "undefined") {
     isDeterministicErrorKind: isDeterministicErrorKind,
     errorMessageFor: errorMessageFor,
     isVideoDevice: isVideoDevice,
+    boundedText: boundedText,
+    normalizeWhitelistEntry: normalizeWhitelistEntry,
+    investigateOutputText: investigateOutputText,
     parseLsofOutput: parseLsofOutput,
     parseFuserOutput: parseFuserOutput,
     parseProbeOutput: parseProbeOutput,
